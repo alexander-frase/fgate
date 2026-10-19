@@ -30,6 +30,8 @@ const REPORT_EVERY: Duration = Duration::from_secs(60);
 pub enum Class {
     Build,
     Gpu,
+    /// Small commands that skip the line (`fgate --now`), held to a small memory ceiling.
+    Now,
 }
 
 impl Class {
@@ -37,6 +39,7 @@ impl Class {
         match self {
             Class::Build => "build",
             Class::Gpu => "gpu",
+            Class::Now => "now",
         }
     }
 
@@ -44,11 +47,12 @@ impl Class {
         match self {
             Class::Build => config.build_slots,
             Class::Gpu => config.gpu_slots,
+            Class::Now => config.now_slots,
         }
     }
 }
 
-pub const CLASSES: [Class; 2] = [Class::Build, Class::Gpu];
+pub const CLASSES: [Class; 3] = [Class::Build, Class::Gpu, Class::Now];
 
 fn overlapped() -> OVERLAPPED {
     // SAFETY: OVERLAPPED is plain data; all zero is its empty value.
@@ -528,6 +532,10 @@ pub fn print_status(config: &Config) {
     );
     for class in CLASSES {
         for (i, holder) in holders(config, class).iter().enumerate() {
+            // Free `now` slots are many and say nothing.
+            if class == Class::Now && holder.is_none() {
+                continue;
+            }
             let text = holder.as_deref().map_or("free".into(), summary);
             println!("  {} slot {i}: {text}", class.name());
         }

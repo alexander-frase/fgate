@@ -12,6 +12,7 @@ unchanged inside a Windows job with a memory and CPU ceiling. `fgate watch` show
 ```text
 fgate cargo test -p my_crate        waits for a build slot, then runs the command unchanged
 fgate --gpu my_game.exe --shots     waits for the GPU slot (games, renderers, screenshot scripts)
+fgate --now cargo publish           skips the line: small commands, within a small memory ceiling
 fgate status                        who holds the slots, who is waiting
 fgate watch                         the same, live: memory, CPU, each job's usage, recent runs
 fgate hook [options]                a Claude Code hook that refuses cargo commands without fgate
@@ -46,6 +47,16 @@ fgate: build slot 0 after 2m05s in line — cargo test --workspace
 fgate: done in 1m12s, peak memory 6.9 GB
 ```
 
+### Small commands: `--now`
+
+Waiting ten minutes behind three builds to run `cargo fmt`, a publish or a quick tool is silly. `fgate --now`
+runs a small command at once, without waiting in line, but it can't be used to slip a build past the queue:
+
+- It runs within a small memory ceiling, `now_mem_gb` (2 GB). A command that grows past it fails with "out of
+  memory", and fgate says it is too big to skip the line and should run again without `--now`.
+- It still waits while free memory is below `min_free_gb` and something else is running, like any second command.
+- At most `now_slots` (4) run at once. `status` and `watch` list them under `now` while they run.
+
 The command's own output and exit code pass through untouched. A gated command that itself runs `fgate …`
 (a script calling cargo, say) doesn't queue a second time: it already holds the slot.
 
@@ -54,8 +65,8 @@ so the status shows `spaceport-sp1: cargo build` rather than a process id.
 
 ## How it works
 
-- **Two kinds of slot.** Build slots for `cargo` and test runs, and a GPU slot for games, renderers and
-  screenshot scripts, so a screenshot run doesn't wait behind a build.
+- **Kinds of slot.** Build slots for `cargo` and test runs, a GPU slot for games, renderers and screenshot
+  scripts, so a screenshot run doesn't wait behind a build, and `now` slots for small commands that skip the line.
 - **A fair line.** Waiters are served in the order they arrived. Places in line and slots are OS file locks
   under `%LOCALAPPDATA%\fgate`, which Windows drops when a process ends however it ends. A crashed or killed agent
   never leaves a slot taken.
@@ -80,6 +91,8 @@ fgate writes the file with defaults on first use. Edit it any time; each command
 | ------------------- | ------------------- | ----------------------------------------------------------------------- |
 | `build_slots`       | 1                   | builds and test runs at once                                            |
 | `gpu_slots`         | 1                   | GPU runs at once                                                        |
+| `now_slots`         | 4                   | small `--now` commands at once                                          |
+| `now_mem_gb`        | 2                   | each `--now` command's memory ceiling                                   |
 | `jobs`              | 6                   | `CARGO_BUILD_JOBS` for a gated cargo command that doesn't set its own   |
 | `cpu_percent`       | 40                  | each command's hard CPU ceiling, percent of all threads (0 = none)      |
 | `mem_gb`            | 40% of RAM, min 8   | each command's memory ceiling, its whole process tree (0 = none)        |
@@ -104,7 +117,8 @@ that refuses a heavy cargo command (`build`, `check`, `test`, `clippy`, `run`, `
 started without `fgate`, and tells the agent the command to use instead. The agent retries with the prefix. Quoted
 text and heredocs don't count, so `git commit -m "cargo test passes"` goes through.
 
-Add it to the project's `.claude/settings.json` (or to `~/.claude/settings.json` for every project):
+Add it to the project's `.claude/settings.json` (or to `~/.claude/settings.json` for every project;
+[examples/settings.json](examples/settings.json) has a complete file):
 
 ```json
 {
@@ -137,12 +151,10 @@ A project can add its own rules as options:
 
 ## Telling the agents
 
-A paragraph like this in `AGENTS.md` or `CLAUDE.md` saves them a refused command:
-
-> Every cargo command that compiles or runs something goes through `fgate`, and so does a game run
-> (`fgate --gpu <exe> …`): `fgate cargo test -p my_crate`. fgate lets one build and one game run go at a time, in
-> the order they arrive, and prints your place in line. When `fgate status` shows a line, run the command in the
-> background and wait for it to finish; don't poll, and don't work around the gate.
+Agents use fgate when their instructions say so. Copy the section in [examples/AGENTS.md](examples/AGENTS.md)
+into your project's `AGENTS.md` or `CLAUDE.md`, and the hook settings in
+[examples/settings.json](examples/settings.json) into `.claude/settings.json`. The instructions mean agents get it
+right the first time, and the hook catches the ones that forget.
 
 ## Updating fgate while agents use it
 

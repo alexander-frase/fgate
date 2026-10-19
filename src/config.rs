@@ -9,6 +9,10 @@ pub struct Config {
     pub build_slots: usize,
     /// GPU runs at once (games, renderers, screenshot scripts).
     pub gpu_slots: usize,
+    /// Small commands at once that skip the line (`fgate --now`).
+    pub now_slots: usize,
+    /// The memory ceiling of each `fgate --now` command.
+    pub now_mem_gb: u32,
     /// `CARGO_BUILD_JOBS` for a gated cargo command that doesn't set its own.
     pub jobs: u32,
     /// Each gated command's share of all CPU threads, a hard ceiling (0 or 100: none).
@@ -27,9 +31,11 @@ pub struct Config {
     pub night: bool,
 }
 
-const KEYS: [&str; 11] = [
+const KEYS: [&str; 13] = [
     "build_slots",
     "gpu_slots",
+    "now_slots",
+    "now_mem_gb",
     "jobs",
     "cpu_percent",
     "mem_gb",
@@ -56,6 +62,8 @@ impl Config {
             dir,
             build_slots: 1,
             gpu_slots: 1,
+            now_slots: 4,
+            now_mem_gb: 2,
             jobs: 6,
             cpu_percent: 40,
             mem_gb: (total_gb * 2 / 5).max(8),
@@ -76,8 +84,16 @@ impl Config {
                         c.set(key.trim(), value.trim());
                     }
                 }
+                let mut more = String::new();
                 if !text.contains("night_from") {
-                    c.append_night(&file, &text);
+                    more += &c.night_text();
+                }
+                if !text.contains("now_slots") {
+                    more += &c.now_text();
+                }
+                if !more.is_empty() {
+                    let gap = if text.ends_with('\n') { "" } else { "\n" };
+                    let _ = std::fs::write(&file, format!("{text}{gap}{more}"));
                 }
             }
             Err(_) => c.write_default(&file),
@@ -95,15 +111,20 @@ impl Config {
         }
         c.build_slots = c.build_slots.max(1);
         c.gpu_slots = c.gpu_slots.max(1);
+        c.now_slots = c.now_slots.max(1);
         c
+    }
+
+    /// The memory ceiling of each command of `class`, in GB (0: none).
+    pub fn mem_gb_for(&self, class: crate::gate::Class) -> u32 {
+        match class {
+            crate::gate::Class::Now => self.now_mem_gb,
+            _ => self.mem_gb,
+        }
     }
 
     pub fn file(&self) -> PathBuf {
         self.dir.join("config.txt")
-    }
-
-    pub fn mem_bytes(&self) -> u64 {
-        self.mem_gb as u64 * (1u64 << 30)
     }
 
     fn set(&mut self, key: &str, value: &str) {
@@ -114,6 +135,8 @@ impl Config {
         match key {
             "build_slots" => self.build_slots = n as usize,
             "gpu_slots" => self.gpu_slots = n as usize,
+            "now_slots" => self.now_slots = n as usize,
+            "now_mem_gb" => self.now_mem_gb = n,
             "jobs" => self.jobs = n.max(1),
             "cpu_percent" => self.cpu_percent = n.min(100),
             "mem_gb" => self.mem_gb = n,
@@ -144,9 +167,14 @@ impl Config {
         )
     }
 
-    fn append_night(&self, file: &Path, text: &str) {
-        let gap = if text.ends_with('\n') { "" } else { "\n" };
-        let _ = std::fs::write(file, format!("{text}{gap}{}", self.night_text()));
+    fn now_text(&self) -> String {
+        format!(
+            "# Small commands that skip the line (`fgate --now`): how many at once, and each one's memory ceiling\n\
+             # in GB. One that needs more is stopped by the ceiling and belongs in the line.\n\
+             now_slots = {}\n\
+             now_mem_gb = {}\n",
+            self.now_slots, self.now_mem_gb
+        )
     }
 
     fn write_default(&self, file: &Path) {
@@ -164,14 +192,15 @@ impl Config {
              # Each gated command's memory ceiling in GB, everything it starts together (0 = none):\n\
              mem_gb = {}\n\
              # A second command waits while less than this many GB are free:\n\
-             min_free_gb = {}\n{}",
+             min_free_gb = {}\n{}{}",
             self.build_slots,
             self.gpu_slots,
             self.jobs,
             self.cpu_percent,
             self.mem_gb,
             self.min_free_gb,
-            self.night_text()
+            self.night_text(),
+            self.now_text()
         );
         let _ = std::fs::create_dir_all(&self.dir);
         let _ = std::fs::write(file, text);

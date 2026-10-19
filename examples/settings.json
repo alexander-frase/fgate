@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash|PowerShell",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "fgate hook --gpu my_game,my_viewer --protect-branch main --no-admin-merge --note \"The rules for building are in AGENTS.md.\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

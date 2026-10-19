@@ -249,19 +249,26 @@ impl View {
         // The slots.
         for (class, holders) in &slots {
             let taken = holders.iter().filter(|h| h.is_some()).count();
+            // `now` runs are short and the slots many: shown only while one runs, without the free ones.
+            if *class == Class::Now && taken == 0 {
+                continue;
+            }
             let mut l = Line::new(width);
             l.push(&format!("{BOLD}{TEXT}"), &format!(" {}", heading(*class)));
             l.push(DIM, &format!("  {taken} of {} in use", holders.len()));
             out.push(l.done());
             for (i, holder) in holders.iter().enumerate() {
                 match holder {
+                    None if *class == Class::Now => {}
                     None => {
                         let mut l = Line::new(width);
                         l.push(GREEN, "   ○ ");
                         l.push(DIM, &format!("slot {i}  free"));
                         out.push(l.done());
                     }
-                    Some(e) => self.draw_holder(&mut out, config, e, i, tick, width),
+                    Some(e) => {
+                        self.draw_holder(&mut out, config.mem_gb_for(*class), e, i, tick, width)
+                    }
                 }
             }
             out.push(String::new());
@@ -374,7 +381,7 @@ impl View {
     fn draw_holder(
         &mut self,
         out: &mut Vec<String>,
-        config: &Config,
+        mem_gb: u32,
         e: &Entry,
         index: usize,
         tick: usize,
@@ -403,8 +410,8 @@ impl View {
             out.push(l.done());
             return;
         };
-        let ceiling = if config.mem_gb > 0 {
-            config.mem_gb as u64 * (1 << 30)
+        let ceiling = if mem_gb > 0 {
+            mem_gb as u64 * (1 << 30)
         } else {
             job::memory().0
         };
@@ -443,6 +450,7 @@ fn heading(class: Class) -> &'static str {
     match class {
         Class::Build => "BUILD",
         Class::Gpu => "GPU",
+        Class::Now => "NOW",
     }
 }
 
