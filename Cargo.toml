@@ -1,0 +1,25 @@
+[package]
+name = "fgate"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.87"
+description = "A build gate for coding agents sharing one Windows machine: builds wait their turn, within CPU and memory ceilings"
+license = "MIT"
+repository = "https://github.com/alexander-frase/fgate"
+readme = "README.md"
+keywords = ["build", "agents", "cargo", "windows", "claude-code"]
+categories = ["command-line-utilities", "development-tools"]
+exclude = ["docs/", ".github/"]
+
+[dependencies]
+serde_json = "1"
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_IO",
+    "Win32_System_JobObjects",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+] }
