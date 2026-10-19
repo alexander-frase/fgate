@@ -1,18 +1,21 @@
 [package]
 name = "fgate"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.87"
-description = "A build gate for coding agents sharing one Windows machine: builds wait their turn, within CPU and memory ceilings"
+description = "The fair gate: coding agents sharing one machine take turns for builds, within CPU and memory ceilings"
 license = "MIT"
 repository = "https://github.com/alexander-frase/fgate"
 readme = "README.md"
-keywords = ["build", "agents", "cargo", "windows", "claude-code"]
+keywords = ["build", "agents", "cargo", "queue", "claude-code"]
 categories = ["command-line-utilities", "development-tools"]
-exclude = ["docs/", "examples/", ".github/"]
+exclude = ["docs/", "examples/", "ci/", ".github/"]
 
 [dependencies]
 serde_json = "1"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [

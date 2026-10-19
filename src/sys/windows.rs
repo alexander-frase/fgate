@@ -1,7 +1,23 @@
-//! The Windows job a gated command runs in: below-normal priority, a hard CPU ceiling, a memory ceiling for
-//! everything it starts together, and all of it killed when fgate ends (no compiler left running alone).
+//! Windows: a gated command runs in a Windows job (below-normal priority, a hard CPU ceiling, a memory ceiling
+//! for everything it starts together, and all of it killed when fgate ends, so no compiler is left running
+//! alone). Slots are byte-range file locks; the terminal is the Windows console.
+
+use std::fs::File;
+use std::os::windows::io::AsRawHandle;
+use std::path::PathBuf;
+use std::process::{Child, Command};
+use std::sync::atomic::Ordering;
 
 use windows_sys::Win32::Foundation::{CloseHandle, FILETIME, HANDLE, SYSTEMTIME};
+use windows_sys::Win32::Storage::FileSystem::{
+    LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx, UnlockFileEx,
+};
+use windows_sys::Win32::System::Console::{
+    CONSOLE_SCREEN_BUFFER_INFO, ENABLE_VIRTUAL_TERMINAL_PROCESSING, GetConsoleMode,
+    GetConsoleScreenBufferInfo, GetStdHandle, STD_OUTPUT_HANDLE, SetConsoleCtrlHandler,
+    SetConsoleMode,
+};
+use windows_sys::Win32::System::IO::OVERLAPPED;
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_CPU_RATE_CONTROL_ENABLE,
     JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP, JOB_OBJECT_LIMIT_JOB_MEMORY,
@@ -18,24 +34,13 @@ use windows_sys::Win32::System::Threading::{
     BELOW_NORMAL_PRIORITY_CLASS, GetCurrentProcess, GetSystemTimes,
 };
 
+use super::Usage;
+
 pub struct Job(HANDLE);
 
 // SAFETY: a job handle is a kernel handle; any thread may query it.
 unsafe impl Send for Job {}
 unsafe impl Sync for Job {}
-
-/// What a running job uses, for `fgate watch`.
-#[derive(Clone, Copy, Default)]
-pub struct Usage {
-    /// Memory its processes hold together now, in bytes (0 where Windows can't say).
-    pub memory: u64,
-    /// The most they held at once, in bytes.
-    pub peak: u64,
-    /// CPU time of all its processes so far, in 100 ns units.
-    pub cpu: u64,
-    /// Processes running in it.
-    pub processes: u32,
-}
 
 /// `JOBOBJECT_MEMORY_USAGE_INFORMATION`, which windows-sys does not list.
 #[repr(C)]
@@ -47,8 +52,33 @@ struct MemoryUsage {
 const JOB_OBJECT_MEMORY_USAGE_INFORMATION: i32 = 28;
 
 impl Job {
-    /// Puts this process into a new job; what it starts from now on joins the job too.
-    pub fn contain(cpu_percent: u32, mem_bytes: u64) -> Result<Job, String> {
+    /// The command to run and the job it runs in, or why it runs without one. fgate itself joins the job, and
+    /// everything it starts from then on joins too.
+    pub fn prepare(
+        program: &str,
+        args: &[String],
+        cpu_percent: u32,
+        mem_bytes: u64,
+    ) -> (Command, Option<Job>, Option<String>) {
+        let mut command = Command::new(program);
+        command.args(args);
+        match Job::contain(cpu_percent, mem_bytes) {
+            Ok(job) => (command, Some(job), None),
+            Err(e) => (
+                command,
+                None,
+                Some(format!("running without CPU and memory ceilings ({e})")),
+            ),
+        }
+    }
+
+    /// The command has started (it joined the job by itself).
+    pub fn started(&self, _child: &Child) {}
+
+    /// The command has ended. What it left running ends when fgate does and the job closes.
+    pub fn finish(&self) {}
+
+    fn contain(cpu_percent: u32, mem_bytes: u64) -> Result<Job, String> {
         // SAFETY: plain Win32 calls on a handle owned here; the structs are plain data, sized as the API expects.
         unsafe {
             let handle = CreateJobObjectW(std::ptr::null(), std::ptr::null());
@@ -209,6 +239,80 @@ pub fn local_time() -> (u32, u32, u32) {
         let mut now: SYSTEMTIME = std::mem::zeroed();
         GetLocalTime(&mut now);
         (now.wHour as u32, now.wMinute as u32, now.wSecond as u32)
+    }
+}
+
+/// Why commands run without memory and CPU ceilings here, if they do: on Windows they always have them.
+pub fn ceilings() -> Option<String> {
+    None
+}
+
+/// Windows has no broken-pipe signal; nothing to do.
+pub fn quiet_broken_pipe() {}
+
+/// Windows keeps per-user program data under %LOCALAPPDATA%.
+pub(super) fn default_dir() -> PathBuf {
+    std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+}
+
+/// The byte a slot or ticket lock sits on: far past anything ever written, because Windows locks keep others from
+/// reading the locked range, and the text must stay readable.
+const LOCK_AT_HIGH: u32 = 0x4000_0000;
+
+fn overlapped() -> OVERLAPPED {
+    // SAFETY: OVERLAPPED is plain data; all zero is its empty value.
+    let mut o: OVERLAPPED = unsafe { std::mem::zeroed() };
+    o.Anonymous.Anonymous.OffsetHigh = LOCK_AT_HIGH;
+    o
+}
+
+/// Takes the file's lock if nobody holds it. Windows drops it when the process ends, however it ends.
+pub fn try_lock(file: &File) -> bool {
+    let mut o = overlapped();
+    let flags = LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY;
+    // SAFETY: a live handle and a valid OVERLAPPED; the call does not block.
+    unsafe { LockFileEx(file.as_raw_handle(), flags, 0, 1, 0, &mut o) != 0 }
+}
+
+pub fn unlock(file: &File) {
+    let mut o = overlapped();
+    // SAFETY: as in try_lock.
+    unsafe { UnlockFileEx(file.as_raw_handle(), 0, 1, 0, &mut o) };
+}
+
+unsafe extern "system" fn on_ctrl(_: u32) -> i32 {
+    super::QUIT.store(true, Ordering::SeqCst);
+    1
+}
+
+/// Readies the console for `fgate watch`: escape sequences on, and Ctrl+C or closing sets `QUIT`.
+pub fn catch_quit() {
+    // SAFETY: plain console calls on this process's own output handle.
+    unsafe {
+        let out = GetStdHandle(STD_OUTPUT_HANDLE);
+        let mut mode = 0;
+        if GetConsoleMode(out, &mut mode) != 0 {
+            SetConsoleMode(out, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+        }
+        SetConsoleCtrlHandler(Some(on_ctrl), 1);
+    }
+}
+
+/// The console window's (columns, rows).
+pub fn console_size() -> (usize, usize) {
+    // SAFETY: plain data filled in by the call.
+    unsafe {
+        let mut info: CONSOLE_SCREEN_BUFFER_INFO = std::mem::zeroed();
+        if GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &mut info) == 0 {
+            return (100, 40);
+        }
+        let w = info.srWindow;
+        (
+            (w.Right - w.Left + 1).max(1) as usize,
+            (w.Bottom - w.Top + 1).max(1) as usize,
+        )
     }
 }
 

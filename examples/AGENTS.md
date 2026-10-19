@@ -16,7 +16,7 @@ Several agents share this machine. Builds must never run it out of memory, so he
   slot, prints your place in line and who is running, then runs the command unchanged. Its output and exit code are
   the command's own.
 - **Programs that need the GPU** (here: `my_game`, `my_viewer`; edit this list) run with `fgate --gpu`:
-  `fgate --gpu target/debug/my_game.exe --screenshot shot.png`. A script that runs cargo or the game runs under
+  `fgate --gpu target/debug/my_game --screenshot shot.png`. A script that runs cargo or the game runs under
   fgate as a whole: `fgate --gpu python take_screenshots.py`.
 - **Small commands skip the line with `fgate --now`**: `cargo fmt`, `cargo publish`, a quick tool run. They get a
   2 GB memory ceiling; if fgate says a `--now` command was too big to skip the line, run it again without `--now`.

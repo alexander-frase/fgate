@@ -51,13 +51,8 @@ impl Config {
     pub fn load() -> Config {
         let dir = std::env::var_os("FGATE_DIR")
             .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                let base = std::env::var_os("LOCALAPPDATA")
-                    .map(PathBuf::from)
-                    .unwrap_or_else(std::env::temp_dir);
-                base.join("fgate")
-            });
-        let total_gb = (crate::job::memory().0 as f64 / (1u64 << 30) as f64).round() as u32;
+            .unwrap_or_else(crate::sys::settings_dir);
+        let total_gb = (crate::sys::memory().0 as f64 / (1u64 << 30) as f64).round() as u32;
         let mut c = Config {
             dir,
             build_slots: 1,
@@ -103,7 +98,7 @@ impl Config {
                 c.set(key, &value);
             }
         }
-        c.night = is_night(crate::job::local_hour(), c.night_from, c.night_until);
+        c.night = is_night(crate::sys::local_hour(), c.night_from, c.night_until);
         if c.night {
             c.build_slots = c.night_build_slots;
             c.mem_gb = c.night_mem_gb;
@@ -129,7 +124,9 @@ impl Config {
 
     fn set(&mut self, key: &str, value: &str) {
         let Ok(n) = value.parse::<u32>() else {
-            eprintln!("fgate: ignoring setting {key} = {value} (not a whole number)");
+            warn(&format!(
+                "ignoring setting {key} = {value} (not a whole number)"
+            ));
             return;
         };
         match key {
@@ -146,7 +143,8 @@ impl Config {
             "night_build_slots" => self.night_build_slots = n as usize,
             "night_mem_gb" => self.night_mem_gb = n,
             "night_min_free_gb" => self.night_min_free_gb = n,
-            _ => eprintln!("fgate: unknown setting {key}"),
+            // A setting from a newer fgate, or a typo.
+            _ => warn(&format!("unknown setting {key}")),
         }
     }
 
@@ -204,6 +202,18 @@ impl Config {
         );
         let _ = std::fs::create_dir_all(&self.dir);
         let _ = std::fs::write(file, text);
+    }
+}
+
+/// Says something about the settings once per run: `watch` and waiting commands read them again and again, and
+/// `watch` would otherwise write over its own screen.
+fn warn(text: &str) {
+    static SAID: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    if let Ok(mut said) = SAID.lock()
+        && !said.iter().any(|s| s == text)
+    {
+        eprintln!("fgate: {text}");
+        said.push(text.to_string());
     }
 }
 

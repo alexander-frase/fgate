@@ -8,19 +8,12 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use windows_sys::Win32::Storage::FileSystem::{
-    LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx, UnlockFileEx,
-};
-use windows_sys::Win32::System::IO::OVERLAPPED;
-
 use crate::config::Config;
+use crate::sys::{try_lock, unlock};
 
-/// Where the locked byte sits: past anything ever written, so the text stays readable.
-const LOCK_AT_HIGH: u32 = 0x4000_0000;
 /// How often a waiter looks again.
 const POLL: Duration = Duration::from_millis(500);
 /// How often a waiter says where it stands when nothing changed.
@@ -53,26 +46,6 @@ impl Class {
 }
 
 pub const CLASSES: [Class; 3] = [Class::Build, Class::Gpu, Class::Now];
-
-fn overlapped() -> OVERLAPPED {
-    // SAFETY: OVERLAPPED is plain data; all zero is its empty value.
-    let mut o: OVERLAPPED = unsafe { std::mem::zeroed() };
-    o.Anonymous.Anonymous.OffsetHigh = LOCK_AT_HIGH;
-    o
-}
-
-fn try_lock(file: &File) -> bool {
-    let mut o = overlapped();
-    let flags = LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY;
-    // SAFETY: a live handle and a valid OVERLAPPED; the call does not block.
-    unsafe { LockFileEx(file.as_raw_handle(), flags, 0, 1, 0, &mut o) != 0 }
-}
-
-fn unlock(file: &File) {
-    let mut o = overlapped();
-    // SAFETY: as in try_lock.
-    unsafe { UnlockFileEx(file.as_raw_handle(), 0, 1, 0, &mut o) };
-}
 
 fn open(path: &Path) -> Option<File> {
     if let Some(dir) = path.parent() {
@@ -205,7 +178,7 @@ pub struct Held {
 impl Held {
     /// Writes what the job uses after what the slot says it runs, for `fgate watch`. The line keeps one width
     /// and is written over in place, so a reader never sees the slot's text cut short.
-    pub fn report(&self, usage: &crate::job::Usage) {
+    pub fn report(&self, usage: &crate::sys::Usage) {
         let line = format!(
             "\nusage {:>20} {:>20} {:>20} {:>10}",
             usage.memory, usage.peak, usage.cpu, usage.processes
@@ -225,7 +198,7 @@ pub struct Entry {
     pub place: String,
     pub command: String,
     /// What a holder's job uses, once it has said.
-    pub usage: Option<crate::job::Usage>,
+    pub usage: Option<crate::sys::Usage>,
 }
 
 impl Entry {
@@ -240,7 +213,7 @@ impl Entry {
                 .strip_prefix("usage")?
                 .split_whitespace()
                 .map(str::parse::<u64>);
-            Some(crate::job::Usage {
+            Some(crate::sys::Usage {
                 memory: n.next()?.ok()?,
                 peak: n.next()?.ok()?,
                 cpu: n.next()?.ok()?,
@@ -417,7 +390,7 @@ fn modified(path: &Path) -> Option<SystemTime> {
 
 /// Free memory, in bytes.
 fn free_memory() -> u64 {
-    crate::job::memory().1
+    crate::sys::memory().1
 }
 
 /// Waits for a slot of `class` in fair order, and takes it.
@@ -515,7 +488,7 @@ pub fn acquire(config: &Config, class: Class, line: &str) -> Held {
 }
 
 pub fn print_status(config: &Config) {
-    let (total, free) = crate::job::memory();
+    let (total, free) = crate::sys::memory();
     println!(
         "fgate: {} of {} free; {}; settings {}",
         size(free),
@@ -530,6 +503,9 @@ pub fn print_status(config: &Config) {
         },
         config.file().display()
     );
+    if let Some(why) = crate::sys::ceilings() {
+        println!("  no memory or CPU ceilings: {why}");
+    }
     for class in CLASSES {
         for (i, holder) in holders(config, class).iter().enumerate() {
             // Free `now` slots are many and say nothing.
