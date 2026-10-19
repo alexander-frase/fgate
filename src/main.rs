@@ -78,6 +78,8 @@ fn run(class: gate::Class, command: &[String]) -> ! {
     let waited = Instant::now();
     let held = gate::acquire(&config, class, &line);
     let waited = waited.elapsed();
+    // The settings as they are now: they may have changed while the command waited.
+    let config = Config::load();
 
     let job = match job::Job::contain(config.cpu_percent, config.mem_bytes()) {
         Ok(job) => Some(Arc::new(job)),

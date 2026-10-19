@@ -406,16 +406,31 @@ fn line_up(config: &Config, class: Class) -> Vec<(PathBuf, String)> {
     waiting
 }
 
+/// When a file last changed, if it can be told.
+fn modified(path: &Path) -> Option<SystemTime> {
+    fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
 /// Free memory, in bytes.
 fn free_memory() -> u64 {
     crate::job::memory().1
 }
 
 /// Waits for a slot of `class` in fair order, and takes it.
+/// The settings are read again while waiting, when the file changes and once a minute (for the night limits), so
+/// slots added while commands wait are used at once.
 pub fn acquire(config: &Config, class: Class, line: &str) -> Held {
     let ticket = take_ticket(config, class, line);
     let mut last_said: Option<(String, Instant)> = None;
+    let mut fresh: Option<Config> = None;
+    let mut read = (modified(&config.file()), Instant::now());
     loop {
+        let changed = modified(&config.file());
+        if changed != read.0 || read.1.elapsed() >= REPORT_EVERY {
+            fresh = Some(Config::load());
+            read = (changed, Instant::now());
+        }
+        let config = fresh.as_ref().unwrap_or(config);
         let waiting = line_up(config, class);
         let position = waiting
             .iter()
