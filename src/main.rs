@@ -9,33 +9,24 @@
 //! ```
 //!
 //! A waiting command keeps its place in a fair line and prints where it stands. Once it has a slot, the
-//! command and everything it starts run in a Windows job: below-normal priority, a CPU ceiling, a memory
-//! ceiling, and killed together when fgate ends. Slots and places in line are OS file locks, which Windows
-//! drops when a process ends however it ends, so nothing is ever left locked by a crashed or killed agent.
-//! Settings: `%LOCALAPPDATA%\fgate\config.txt` (written with defaults on first use).
+//! command and everything it starts run at low priority within a CPU and memory ceiling (a Windows job, a
+//! systemd scope on Linux; macOS has no such ceilings) and end together when fgate ends. Slots and places in
+//! line are OS file locks, which the system drops when a process ends however it ends, so nothing is ever left
+//! locked by a crashed or killed agent. Settings: `config.txt` in fgate's folder, which `fgate status` names
+//! (written with defaults on first use).
 
-#[cfg(windows)]
 mod config;
-#[cfg(windows)]
 mod gate;
-#[cfg(windows)]
 mod hook;
-#[cfg(windows)]
-mod job;
-#[cfg(windows)]
+mod sys;
 mod watch;
 
-#[cfg(windows)]
 use std::process::{Command, ExitCode};
-#[cfg(windows)]
 use std::sync::{Arc, Mutex};
-#[cfg(windows)]
 use std::time::{Duration, Instant};
 
-#[cfg(windows)]
 use config::Config;
 
-#[cfg(windows)]
 const HELP: &str = "fgate: the build gate (https://github.com/alexander-frase/fgate)
   fgate <command> [args…]      run a build or test command in a build slot (waits its turn)
   fgate --gpu <command> […]    run a GPU program (game, renderer, screenshot script) in the GPU slot
@@ -49,15 +40,23 @@ const HELP: &str = "fgate: the build gate (https://github.com/alexander-frase/fg
       --protect-label <name>     refuse `gh` commands that name this label
       --no-admin-merge           refuse `gh pr merge --admin`
       --note <text>              added to every refusal
-Settings: %LOCALAPPDATA%\\fgate\\config.txt, or FGATE_* environment variables.";
+Settings: config.txt in fgate's folder (`fgate status` shows where), or FGATE_* environment variables.";
 
-#[cfg(windows)]
 /// Set for everything fgate runs: a gated command that starts another `fgate …` already holds a slot.
 const HELD_VAR: &str = "FGATE_HELD";
 
-#[cfg(windows)]
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    #[cfg(unix)]
+    if args.first().map(String::as_str) == Some(sys::IN_SCOPE) {
+        sys::in_scope(&args[1..]);
+    }
+    if matches!(
+        args.first().map(String::as_str),
+        None | Some("-h" | "--help" | "help" | "status")
+    ) {
+        sys::quiet_broken_pipe();
+    }
     match args.first().map(String::as_str) {
         None | Some("-h" | "--help" | "help") => {
             println!("{HELP}");
@@ -75,18 +74,14 @@ fn main() -> ExitCode {
     }
 }
 
-#[cfg(windows)]
 fn run(class: gate::Class, command: &[String]) -> ! {
     let Some((program, args)) = command.split_first() else {
         eprintln!("fgate: no command given\n{HELP}");
         std::process::exit(2);
     };
-    let mut child = Command::new(program);
-    child.args(args);
-
     // Already inside a gated command: run straight away, it owns a slot.
     if std::env::var_os(HELD_VAR).is_some() {
-        exit(child.status());
+        exit(Command::new(program).args(args).status());
     }
 
     let config = Config::load();
@@ -99,13 +94,11 @@ fn run(class: gate::Class, command: &[String]) -> ! {
 
     let mem_gb = config.mem_gb_for(class);
     let mem_bytes = mem_gb as u64 * (1u64 << 30);
-    let job = match job::Job::contain(config.cpu_percent, mem_bytes) {
-        Ok(job) => Some(Arc::new(job)),
-        Err(e) => {
-            eprintln!("fgate: running without CPU and memory ceilings ({e})");
-            None
-        }
-    };
+    let (mut child, job, note) = sys::Job::prepare(program, args, config.cpu_percent, mem_bytes);
+    if let Some(note) = note {
+        eprintln!("fgate: {note}");
+    }
+    let job = job.map(Arc::new);
     child.env(HELD_VAR, class.name());
     if class != gate::Class::Gpu && std::env::var_os("CARGO_BUILD_JOBS").is_none() {
         child.env("CARGO_BUILD_JOBS", config.jobs.to_string());
@@ -140,27 +133,34 @@ fn run(class: gate::Class, command: &[String]) -> ! {
     }
 
     let ran = Instant::now();
-    let status = child.status();
+    let status = child.spawn().and_then(|mut running| {
+        if let Some(job) = &job {
+            job.started(&running);
+        }
+        running.wait()
+    });
     let ran = ran.elapsed();
-    let peak = job.as_deref().map(job::Job::peak_memory).unwrap_or(0);
+    let peak = job.as_deref().map(sys::Job::peak_memory).unwrap_or(0);
+    let exit_code = status.as_ref().map_or(127, code);
+    let hit = job.as_deref().is_some_and(|job| job.hit_ceiling(exit_code));
     let mut summary = format!("fgate: done in {}", gate::duration(ran));
     if peak > 0 {
         summary += &format!(", peak memory {}", gate::size(peak));
-        if mem_bytes > 0 && peak as f64 >= mem_bytes as f64 * 0.95 {
-            summary += &if class == gate::Class::Now {
-                format!(
-                    " — it reached the {mem_gb} GB ceiling of `fgate --now`, so an \"out of memory\" failure above \
-                     came from fgate, not the code: this command is too big to skip the line. Run it again without \
-                     `--now`."
-                )
-            } else {
-                format!(
-                    " — it reached the {mem_gb} GB ceiling, so an \"out of memory\" failure above came from fgate, \
-                     not the code (raise mem_gb in {})",
-                    config.file().display()
-                )
-            };
-        }
+    }
+    if mem_bytes > 0 && (hit || peak as f64 >= mem_bytes as f64 * 0.95) {
+        summary += &if class == gate::Class::Now {
+            format!(
+                " — it reached the {mem_gb} GB ceiling of `fgate --now`, so an \"out of memory\" failure or a \
+                 killed process above came from fgate, not the code: this command is too big to skip the line. \
+                 Run it again without `--now`."
+            )
+        } else {
+            format!(
+                " — it reached the {mem_gb} GB ceiling, so an \"out of memory\" failure or a killed process \
+                 above came from fgate, not the code (raise mem_gb in {})",
+                config.file().display()
+            )
+        };
     }
     eprintln!("{summary}");
     // Gives the slot back (the reporter stops with it).
@@ -178,21 +178,23 @@ fn run(class: gate::Class, command: &[String]) -> ! {
             waited,
             peak,
             code: match &status {
-                Ok(s) => s.code().unwrap_or(1),
+                Ok(s) => code(s),
                 Err(_) => 127,
             },
         },
     );
-    // Exits while the job is still open: closing it ends every process in it, fgate included, which would
-    // replace the command's exit code.
+    // Ends what the command left running. On Windows that happens when fgate exits with the job still open
+    // (closing it first would end fgate too, and replace the command's exit code).
+    if let Some(job) = &job {
+        job.finish();
+    }
     exit(status)
 }
 
-#[cfg(windows)]
 /// Ends fgate with the command's own exit code (Windows codes can be large or negative, such as a crash's).
 fn exit(status: std::io::Result<std::process::ExitStatus>) -> ! {
     match status {
-        Ok(s) => std::process::exit(s.code().unwrap_or(1)),
+        Ok(s) => std::process::exit(code(&s)),
         Err(e) => {
             eprintln!("fgate: could not start the command: {e}");
             std::process::exit(127)
@@ -200,7 +202,15 @@ fn exit(status: std::io::Result<std::process::ExitStatus>) -> ! {
     }
 }
 
-#[cfg(windows)]
+/// A finished command's exit code; one ended by a signal gives 128 + the signal, as shells do.
+fn code(status: &std::process::ExitStatus) -> i32 {
+    #[cfg(unix)]
+    if let Some(signal) = std::os::unix::process::ExitStatusExt::signal(status) {
+        return 128 + signal;
+    }
+    status.code().unwrap_or(1)
+}
+
 /// The command as the status shows it: the program without its folder, at most 140 characters.
 fn short(command: &[String]) -> String {
     let program = command[0].replace('\\', "/");
@@ -216,11 +226,5 @@ fn short(command: &[String]) -> String {
     line
 }
 
-#[cfg(not(windows))]
-compile_error!(
-    "fgate runs on Windows only for now: it uses Windows job objects and file locks. \
-     Linux and macOS support is planned: https://github.com/alexander-frase/fgate"
-);
-
-#[cfg(not(windows))]
-fn main() {}
+#[cfg(not(any(windows, unix)))]
+compile_error!("fgate runs on Windows, Linux and macOS.");

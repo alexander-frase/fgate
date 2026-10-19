@@ -2,10 +2,11 @@
 
 **The fair gate: a build gate for coding agents that share one machine.**
 
-Run five or ten coding agents (Claude Code, or anything else with a shell) on one Windows PC and sooner or
-later they all start `cargo build` at once. Memory fills up, the machine freezes, and builds die with "out of
-memory". fgate makes them take turns. Each heavy command waits in a fair line for a free slot, then runs
-unchanged inside a Windows job with a memory and CPU ceiling. `fgate watch` shows the whole thing live.
+Run five or ten coding agents (Claude Code, or anything else with a shell) on one machine and sooner or later
+they all start `cargo build` at once. Memory fills up, the machine freezes, and builds die with "out of memory".
+fgate makes them take turns. Each heavy command waits in a fair line for a free slot, then runs unchanged at low
+priority, within a memory and CPU ceiling. `fgate watch` shows the whole thing live. It runs on Windows, Linux and
+macOS.
 
 ![fgate watch: one build and one GPU run in their slots, five commands waiting in line, and the recent runs](docs/fgate-watch.png)
 
@@ -20,13 +21,13 @@ fgate hook [options]                a Claude Code hook that refuses cargo comman
 
 ## Install
 
-fgate runs on Windows 10/11 and needs Rust 1.87 or newer.
+fgate runs on Windows 10/11, Linux and macOS, and needs Rust 1.87 or newer.
 
 ```sh
 cargo install fgate --locked
 ```
 
-That puts `fgate.exe` in `~/.cargo/bin`. One install serves every project and every agent on the machine.
+That puts `fgate` in `~/.cargo/bin`. One install serves every project and every agent on the machine.
 
 ## Using it
 
@@ -34,7 +35,7 @@ Put `fgate` in front of any command that compiles or runs something heavy:
 
 ```sh
 fgate cargo build --release
-CARGO_TARGET_DIR=E:/shared/target fgate cargo test --workspace
+CARGO_TARGET_DIR=~/shared/target fgate cargo test --workspace
 fgate --gpu python take_screenshots.py      # a script that runs the game is gated as a whole
 ```
 
@@ -67,25 +68,32 @@ so the status shows `spaceport-sp1: cargo build` rather than a process id.
 
 - **Kinds of slot.** Build slots for `cargo` and test runs, a GPU slot for games, renderers and screenshot
   scripts, so a screenshot run doesn't wait behind a build, and `now` slots for small commands that skip the line.
-- **A fair line.** Waiters are served in the order they arrived. Places in line and slots are OS file locks
-  under `%LOCALAPPDATA%\fgate`, which Windows drops when a process ends however it ends. A crashed or killed agent
-  never leaves a slot taken.
+- **A fair line.** Waiters are served in the order they arrived. Places in line and slots are file locks in
+  fgate's folder, which the system drops when a process ends however it ends. A crashed or killed agent never
+  leaves a slot taken.
 - **Waiting for memory.** Memory is usually what runs out first, and a build's memory grows as it goes. A second
   command waits while less than `min_free_gb` is free. At night, every command waits for it, even alone.
-- **A Windows job per command.** Once in, the command and everything it starts run in one job object:
-  below-normal priority, a hard CPU ceiling, one memory ceiling for the whole process tree, and all of it killed
-  together when fgate ends, so no compiler is left running on its own. If the job hits its memory ceiling, fgate
-  says so, so an "out of memory" from the gate isn't mistaken for a bug in your code.
+- **One job per command.** Once in, the command and everything it starts run as one job: at low priority,
+  within one memory ceiling and a CPU ceiling for the whole process tree, and ended together, so no compiler is
+  left running on its own. If the job hits its memory ceiling, fgate says so, so an "out of memory" from the gate
+  isn't mistaken for a bug in your code. How each system does it is under [Platforms](#platforms).
 - **Compiler jobs.** A gated cargo command gets `CARGO_BUILD_JOBS` from the settings, unless it sets its own.
 - **Night limits.** Between `night_from` and `night_until` (local time) stricter limits apply, for agents that
   keep working while nobody watches.
-- **History.** Finished commands are logged to `%LOCALAPPDATA%\fgate\history.log` (last 300). `fgate watch`
+- **History.** Finished commands are logged to `history.log` in fgate's folder (last 300). `fgate watch`
   shows them with run time, peak memory, time waited and exit code.
 
 ## Settings
 
-The settings live in `%LOCALAPPDATA%\fgate\config.txt`, one file per machine, so every agent counts the same slots.
-fgate writes the file with defaults on first use. Edit it any time; each command reads it when it starts.
+The settings live in `config.txt` in fgate's folder, one file per machine, so every agent counts the same slots.
+fgate writes the file with defaults on first use. Edit it any time: each command reads it when it starts, and a
+waiting command reads it again when it changes. `fgate status` shows where the folder is:
+
+| System  | fgate's folder                                                  |
+| ------- | --------------------------------------------------------------- |
+| Windows | `%LOCALAPPDATA%\fgate`                                          |
+| Linux   | `$XDG_STATE_HOME/fgate`, or `~/.local/state/fgate`              |
+| macOS   | `~/Library/Application Support/fgate`                           |
 
 | Setting             | Default             | Meaning                                                                 |
 | ------------------- | ------------------- | ----------------------------------------------------------------------- |
@@ -158,17 +166,39 @@ right the first time, and the hook catches the ones that forget.
 
 ## Updating fgate while agents use it
 
-Windows won't overwrite a running `fgate.exe`. Rename it first, install, and delete the old one once nothing runs it:
+On Linux and macOS, `cargo install fgate --locked` replaces it in place; running commands keep the old version
+until they end.
+
+On Windows, `cargo install` can't overwrite a running `fgate.exe`, and with the hook in place one runs almost all
+the time. Build the new one beside it (through the gate, while the old one keeps working), then swap them by
+renaming, which Windows allows while a program runs. Delete the old one once nothing runs it:
 
 ```sh
+fgate cargo install fgate --locked --root ~/fgate-new
 mv ~/.cargo/bin/fgate.exe ~/.cargo/bin/fgate-old.exe
-cargo install fgate --locked
+mv ~/fgate-new/bin/fgate.exe ~/.cargo/bin/fgate.exe
 ```
 
-## Platform
+A `fgate watch` that is open keeps showing the old version: restart it.
 
-Windows only for now: the slots use Windows file locks and the ceilings use Windows job objects. On Linux and
-macOS, `cargo install fgate` stops with a message saying so. Support for both is planned.
+## Platforms
+
+| | Windows | Linux | macOS |
+| --- | --- | --- | --- |
+| Fair line, slots, `--now`, memory waiting, night limits, `watch`, hook | yes | yes | yes |
+| Low priority | below normal | nice 10 | nice 10 |
+| Everything a command started ends with it | Windows job | process group | process group |
+| Hard memory and CPU ceiling | Windows job | systemd scope (cgroups), with a systemd user session | no |
+| Memory and CPU use per command | job accounting | process group (`/proc`), scope peak | process group |
+
+- **Linux.** The ceilings need a systemd user session (`systemd-run --user`), which desktop and most server
+  installs have. Where there isn't one (containers, WSL without systemd), fgate runs commands without ceilings and
+  says so; the line and the wait for free memory still keep the machine safe.
+- **macOS** has no way to hold a process tree to a memory or CPU ceiling, so commands run without one, and the
+  wait for free memory carries the load. `--now` can't stop a command that grows too big here. Tested in CI on
+  GitHub's macOS machines; reports from daily use are welcome.
+- Commands run in their own process group. When fgate runs in a terminal, the command gets the terminal, so Ctrl+C
+  and typed input reach it as usual.
 
 ## License
 

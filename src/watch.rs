@@ -5,18 +5,12 @@
 use std::collections::{HashMap, VecDeque};
 use std::io::Write;
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
-
-use windows_sys::Win32::System::Console::{
-    CONSOLE_SCREEN_BUFFER_INFO, ENABLE_VIRTUAL_TERMINAL_PROCESSING, GetConsoleMode,
-    GetConsoleScreenBufferInfo, GetStdHandle, STD_OUTPUT_HANDLE, SetConsoleCtrlHandler,
-    SetConsoleMode,
-};
 
 use crate::config::Config;
 use crate::gate::{self, CLASSES, Class, Entry};
-use crate::job;
+use crate::sys::{self as job, QUIT};
 
 /// How often the view redraws.
 const FRAME: Duration = Duration::from_millis(250);
@@ -36,23 +30,8 @@ const CYAN: &str = "\x1b[38;2;95;200;235m";
 const NIGHT: &str = "\x1b[38;2;150;140;255m";
 const TRACK: &str = "\x1b[38;2;55;58;70m";
 
-static QUIT: AtomicBool = AtomicBool::new(false);
-
-unsafe extern "system" fn on_ctrl(_: u32) -> i32 {
-    QUIT.store(true, Ordering::SeqCst);
-    1
-}
-
 pub fn run() -> ExitCode {
-    // SAFETY: plain console calls on this process's own output handle.
-    unsafe {
-        let out = GetStdHandle(STD_OUTPUT_HANDLE);
-        let mut mode = 0;
-        if GetConsoleMode(out, &mut mode) != 0 {
-            SetConsoleMode(out, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
-        }
-        SetConsoleCtrlHandler(Some(on_ctrl), 1);
-    }
+    job::catch_quit();
     let mut stdout = std::io::stdout();
     // Own screen, no cursor, a window title.
     let _ = write!(stdout, "\x1b[?1049h\x1b[?25l\x1b]0;fgate watch\x07");
@@ -62,7 +41,7 @@ pub fn run() -> ExitCode {
     while !QUIT.load(Ordering::SeqCst) {
         let config = Config::load();
         view.sample();
-        let (cols, rows) = console_size();
+        let (cols, rows) = job::console_size();
         let frame = view.draw(&config, tick, cols, rows);
         let _ = write!(stdout, "\x1b[H{}\x1b[K\x1b[J", frame.join("\x1b[K\r\n"));
         let _ = stdout.flush();
@@ -74,22 +53,6 @@ pub fn run() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// The console window's (columns, rows).
-fn console_size() -> (usize, usize) {
-    // SAFETY: plain data filled in by the call.
-    unsafe {
-        let mut info: CONSOLE_SCREEN_BUFFER_INFO = std::mem::zeroed();
-        if GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &mut info) == 0 {
-            return (100, 40);
-        }
-        let w = info.srWindow;
-        (
-            (w.Right - w.Left + 1).max(1) as usize,
-            (w.Bottom - w.Top + 1).max(1) as usize,
-        )
-    }
-}
-
 /// What the view remembers between frames: the CPU and memory history, and each job's last CPU reading.
 #[derive(Default)]
 struct View {
@@ -99,6 +62,8 @@ struct View {
     last_sample: Option<Instant>,
     /// Per running job (slot file text's start): its CPU time and when it was read, and its share since.
     jobs: HashMap<(String, u64), (u64, Instant, f64)>,
+    /// Why there are no memory and CPU ceilings on this system, if there aren't (asked once).
+    no_ceilings: Option<Option<String>>,
 }
 
 impl View {
@@ -228,15 +193,19 @@ impl View {
         );
         out.push(l.done());
 
+        let no_ceilings = self.no_ceilings.get_or_insert_with(job::ceilings).clone();
+        let ceilings = match &no_ceilings {
+            Some(why) => format!("no memory or CPU ceilings ({why})"),
+            None => format!("{} GB per job", config.mem_gb),
+        };
         let mut l = Line::new(width);
         l.push(
             DIM,
             &format!(
-                " limits   {} GB per job · {} jobs · a second job waits below {} GB free{}",
-                config.mem_gb,
+                " limits   {ceilings} · {} jobs · a second job waits below {} GB free{}",
                 config.jobs,
                 config.min_free_gb,
-                if config.cpu_percent > 0 && config.cpu_percent < 100 {
+                if no_ceilings.is_none() && config.cpu_percent > 0 && config.cpu_percent < 100 {
                     format!(" · CPU ≤ {}%", config.cpu_percent)
                 } else {
                     String::new()
