@@ -39,6 +39,8 @@ use config::Config;
 const HELP: &str = "fgate: the build gate (https://github.com/alexander-frase/fgate)
   fgate <command> [args…]      run a build or test command in a build slot (waits its turn)
   fgate --gpu <command> […]    run a GPU program (game, renderer, screenshot script) in the GPU slot
+  fgate --now <command> […]    run a small command at once, skipping the line, within a small memory
+                               ceiling (now_mem_gb); one that needs more belongs in the line
   fgate status                 show the slots and the line
   fgate watch                  a live view of the slots, the line and recent runs (Ctrl+C ends it)
   fgate hook [options]         Claude Code PreToolUse hook (reads the tool call on stdin)
@@ -68,6 +70,7 @@ fn main() -> ExitCode {
         Some("watch") => watch::run(),
         Some("hook") => hook::run(&args[1..]),
         Some("--gpu") => run(gate::Class::Gpu, &args[1..]),
+        Some("--now") => run(gate::Class::Now, &args[1..]),
         Some(_) => run(gate::Class::Build, &args),
     }
 }
@@ -94,7 +97,9 @@ fn run(class: gate::Class, command: &[String]) -> ! {
     // The settings as they are now: they may have changed while the command waited.
     let config = Config::load();
 
-    let job = match job::Job::contain(config.cpu_percent, config.mem_bytes()) {
+    let mem_gb = config.mem_gb_for(class);
+    let mem_bytes = mem_gb as u64 * (1u64 << 30);
+    let job = match job::Job::contain(config.cpu_percent, mem_bytes) {
         Ok(job) => Some(Arc::new(job)),
         Err(e) => {
             eprintln!("fgate: running without CPU and memory ceilings ({e})");
@@ -102,7 +107,7 @@ fn run(class: gate::Class, command: &[String]) -> ! {
         }
     };
     child.env(HELD_VAR, class.name());
-    if class == gate::Class::Build && std::env::var_os("CARGO_BUILD_JOBS").is_none() {
+    if class != gate::Class::Gpu && std::env::var_os("CARGO_BUILD_JOBS").is_none() {
         child.env("CARGO_BUILD_JOBS", config.jobs.to_string());
     }
     eprintln!(
@@ -141,13 +146,20 @@ fn run(class: gate::Class, command: &[String]) -> ! {
     let mut summary = format!("fgate: done in {}", gate::duration(ran));
     if peak > 0 {
         summary += &format!(", peak memory {}", gate::size(peak));
-        if config.mem_bytes() > 0 && peak as f64 >= config.mem_bytes() as f64 * 0.95 {
-            summary += &format!(
-                " — it reached the {} GB ceiling, so an \"out of memory\" failure above came from fgate, not the code \
-                 (raise mem_gb in {})",
-                config.mem_gb,
-                config.file().display()
-            );
+        if mem_bytes > 0 && peak as f64 >= mem_bytes as f64 * 0.95 {
+            summary += &if class == gate::Class::Now {
+                format!(
+                    " — it reached the {mem_gb} GB ceiling of `fgate --now`, so an \"out of memory\" failure above \
+                     came from fgate, not the code: this command is too big to skip the line. Run it again without \
+                     `--now`."
+                )
+            } else {
+                format!(
+                    " — it reached the {mem_gb} GB ceiling, so an \"out of memory\" failure above came from fgate, \
+                     not the code (raise mem_gb in {})",
+                    config.file().display()
+                )
+            };
         }
     }
     eprintln!("{summary}");
