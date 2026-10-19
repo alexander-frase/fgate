@@ -209,11 +209,11 @@ impl Config {
 /// `watch` would otherwise write over its own screen.
 fn warn(text: &str) {
     static SAID: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
-    if let Ok(mut said) = SAID.lock()
-        && !said.iter().any(|s| s == text)
-    {
-        eprintln!("fgate: {text}");
-        said.push(text.to_string());
+    if let Ok(mut said) = SAID.lock() {
+        if !said.iter().any(|s| s == text) {
+            eprintln!("fgate: {text}");
+            said.push(text.to_string());
+        }
     }
 }
 
