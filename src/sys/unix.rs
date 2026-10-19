@@ -23,6 +23,8 @@ pub struct Job {
     peak: AtomicU64,
     /// The command was given the terminal, which fgate takes back when it ends.
     terminal: bool,
+    /// Where fgate's watcher inside a systemd scope leaves the scope's peak memory and out-of-memory kills.
+    report: Option<PathBuf>,
 }
 
 impl Job {
@@ -34,17 +36,24 @@ impl Job {
         cpu_percent: u32,
         mem_bytes: u64,
     ) -> (Command, Option<Job>, Option<String>) {
-        let mut command = match scope(cpu_percent, mem_bytes) {
-            Some(properties) => {
+        let mut report = None;
+        let mut command = match (scope(cpu_percent, mem_bytes), std::env::current_exe()) {
+            (Some(properties), Ok(me)) => {
+                // systemd removes a scope, with its record of the peak and of out-of-memory kills, the moment it
+                // is empty. So fgate's own watcher runs in it around the command, reads both once the command
+                // ends, and leaves them in a file for this fgate.
+                let path = std::env::temp_dir().join(format!("fgate-scope-{}", std::process::id()));
                 let mut command = Command::new("systemd-run");
                 command.args(["--user", "--scope", "--quiet", "--collect"]);
                 for p in properties {
                     command.arg("-p").arg(p);
                 }
-                command.arg("--").arg(program).args(args);
+                command.arg("--").arg(me).arg(IN_SCOPE).arg(&path);
+                command.arg(program).args(args);
+                report = Some(path);
                 command
             }
-            None => {
+            _ => {
                 let mut command = Command::new(program);
                 command.args(args);
                 command
@@ -71,6 +80,7 @@ impl Job {
             group: AtomicI32::new(0),
             peak: AtomicU64::new(0),
             terminal,
+            report,
         };
         (command, Some(job), None)
     }
@@ -93,6 +103,9 @@ impl Job {
 
     /// The command has ended: ends what it left running, and takes the terminal back.
     pub fn finish(&self) {
+        if let Some(path) = &self.report {
+            let _ = std::fs::remove_file(path);
+        }
         let group = self.group.swap(0, Ordering::SeqCst);
         GROUP.store(0, Ordering::SeqCst);
         // SAFETY: plain system calls on our own process group and terminal.
@@ -110,7 +123,27 @@ impl Job {
 
     /// The most memory the command's processes held together at once, in bytes, as far as fgate saw.
     pub fn peak_memory(&self) -> u64 {
-        self.usage().peak
+        let (peak, _) = self.scope_report();
+        self.peak
+            .fetch_max(peak, Ordering::SeqCst)
+            .max(peak)
+            .max(self.usage().peak)
+    }
+
+    /// Whether the memory ceiling stopped a process of the command (the system's out-of-memory killer, inside
+    /// the scope).
+    pub fn hit_ceiling(&self) -> bool {
+        self.scope_report().1 > 0
+    }
+
+    /// What the watcher in the scope left: (peak memory in bytes, out-of-memory kills).
+    fn scope_report(&self) -> (u64, u64) {
+        let Some(path) = &self.report else {
+            return (0, 0);
+        };
+        let text = std::fs::read_to_string(path).unwrap_or_default();
+        let mut numbers = text.split_whitespace().map(|n| n.parse().unwrap_or(0));
+        (numbers.next().unwrap_or(0), numbers.next().unwrap_or(0))
     }
 
     /// Memory, CPU time and processes of the command's group, as they stand now.
@@ -127,6 +160,60 @@ impl Job {
         usage.peak = self.peak.fetch_max(peak, Ordering::SeqCst).max(peak);
         usage
     }
+}
+
+/// The hidden first argument that makes fgate the watcher inside a systemd scope.
+pub const IN_SCOPE: &str = "--in-scope";
+
+/// fgate as the watcher inside a systemd scope: runs the command, then leaves the scope's peak memory and its
+/// out-of-memory kills in the report file, and ends with the command's exit code.
+pub fn in_scope(args: &[String]) -> ! {
+    let [report, program, rest @ ..] = args else {
+        eprintln!("fgate: {IN_SCOPE} needs a report file and a command");
+        std::process::exit(2);
+    };
+    let status = Command::new(program).args(rest).status();
+    let (peak, kills) = own_scope();
+    let _ = std::fs::write(report, format!("{peak} {kills}\n"));
+    match status {
+        Ok(s) => std::process::exit(
+            std::os::unix::process::ExitStatusExt::signal(&s)
+                .map_or(s.code().unwrap_or(1), |sig| 128 + sig),
+        ),
+        Err(e) => {
+            eprintln!("fgate: could not start the command: {e}");
+            std::process::exit(127)
+        }
+    }
+}
+
+/// This process's own scope: (peak memory in bytes, out-of-memory kills).
+#[cfg(target_os = "linux")]
+fn own_scope() -> (u64, u64) {
+    let Some(dir) = std::fs::read_to_string("/proc/self/cgroup")
+        .ok()
+        .and_then(|t| {
+            t.lines()
+                .find_map(|l| l.strip_prefix("0::").map(str::to_string))
+        })
+    else {
+        return (0, 0);
+    };
+    let read = |file: &str| {
+        std::fs::read_to_string(format!("/sys/fs/cgroup{dir}/{file}")).unwrap_or_default()
+    };
+    let peak = read("memory.peak").trim().parse().unwrap_or(0);
+    let kills = read("memory.events")
+        .lines()
+        .find_map(|l| l.strip_prefix("oom_kill "))
+        .and_then(|n| n.trim().parse().ok())
+        .unwrap_or(0);
+    (peak, kills)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn own_scope() -> (u64, u64) {
+    (0, 0)
 }
 
 extern "C" fn forward(signal: libc::c_int) {

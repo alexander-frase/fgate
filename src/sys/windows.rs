@@ -78,6 +78,12 @@ impl Job {
     /// The command has ended. What it left running ends when fgate does and the job closes.
     pub fn finish(&self) {}
 
+    /// Whether the memory ceiling stopped the command. A Windows job refuses memory past its ceiling instead of
+    /// ending a process, and its peak shows that.
+    pub fn hit_ceiling(&self) -> bool {
+        false
+    }
+
     fn contain(cpu_percent: u32, mem_bytes: u64) -> Result<Job, String> {
         // SAFETY: plain Win32 calls on a handle owned here; the structs are plain data, sized as the API expects.
         unsafe {

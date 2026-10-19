@@ -47,6 +47,10 @@ const HELD_VAR: &str = "FGATE_HELD";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    #[cfg(unix)]
+    if args.first().map(String::as_str) == Some(sys::IN_SCOPE) {
+        sys::in_scope(&args[1..]);
+    }
     if matches!(
         args.first().map(String::as_str),
         None | Some("-h" | "--help" | "help" | "status")
@@ -137,24 +141,25 @@ fn run(class: gate::Class, command: &[String]) -> ! {
     });
     let ran = ran.elapsed();
     let peak = job.as_deref().map(sys::Job::peak_memory).unwrap_or(0);
+    let hit = job.as_deref().is_some_and(sys::Job::hit_ceiling);
     let mut summary = format!("fgate: done in {}", gate::duration(ran));
     if peak > 0 {
         summary += &format!(", peak memory {}", gate::size(peak));
-        if mem_bytes > 0 && peak as f64 >= mem_bytes as f64 * 0.95 {
-            summary += &if class == gate::Class::Now {
-                format!(
-                    " — it reached the {mem_gb} GB ceiling of `fgate --now`, so an \"out of memory\" failure above \
-                     came from fgate, not the code: this command is too big to skip the line. Run it again without \
-                     `--now`."
-                )
-            } else {
-                format!(
-                    " — it reached the {mem_gb} GB ceiling, so an \"out of memory\" failure above came from fgate, \
-                     not the code (raise mem_gb in {})",
-                    config.file().display()
-                )
-            };
-        }
+    }
+    if mem_bytes > 0 && (hit || peak as f64 >= mem_bytes as f64 * 0.95) {
+        summary += &if class == gate::Class::Now {
+            format!(
+                " — it reached the {mem_gb} GB ceiling of `fgate --now`, so an \"out of memory\" failure or a \
+                 killed process above came from fgate, not the code: this command is too big to skip the line. \
+                 Run it again without `--now`."
+            )
+        } else {
+            format!(
+                " — it reached the {mem_gb} GB ceiling, so an \"out of memory\" failure or a killed process \
+                 above came from fgate, not the code (raise mem_gb in {})",
+                config.file().display()
+            )
+        };
     }
     eprintln!("{summary}");
     // Gives the slot back (the reporter stops with it).
