@@ -80,7 +80,7 @@ impl Job {
 
     /// Whether the memory ceiling stopped the command. A Windows job refuses memory past its ceiling instead of
     /// ending a process, and its peak shows that.
-    pub fn hit_ceiling(&self) -> bool {
+    pub fn hit_ceiling(&self, _code: i32) -> bool {
         false
     }
 

@@ -43,6 +43,7 @@ impl Job {
                 // is empty. So fgate's own watcher runs in it around the command, reads both once the command
                 // ends, and leaves them in a file for this fgate.
                 let path = std::env::temp_dir().join(format!("fgate-scope-{}", std::process::id()));
+                let _ = std::fs::remove_file(&path);
                 let mut command = Command::new("systemd-run");
                 command.args(["--user", "--scope", "--quiet", "--collect"]);
                 for p in properties {
@@ -131,9 +132,13 @@ impl Job {
     }
 
     /// Whether the memory ceiling stopped a process of the command (the system's out-of-memory killer, inside
-    /// the scope).
-    pub fn hit_ceiling(&self) -> bool {
-        self.scope_report().1 > 0
+    /// the scope), given the command's exit code.
+    pub fn hit_ceiling(&self, code: i32) -> bool {
+        let Some(path) = &self.report else {
+            return false;
+        };
+        // No report at all, and the command was killed: the ceiling ended the whole scope, watcher and all.
+        self.scope_report().1 > 0 || (!path.exists() && code == 128 + libc::SIGKILL)
     }
 
     /// What the watcher in the scope left: (peak memory in bytes, out-of-memory kills).
@@ -247,7 +252,18 @@ fn scope(cpu_percent: u32, mem_bytes: u64) -> Option<Vec<String>> {
         let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
         properties.push(format!("CPUQuota={}%", cpu_percent as usize * threads));
     }
-    (!properties.is_empty() && systemd_user(&properties)).then_some(properties)
+    if properties.is_empty() {
+        return None;
+    }
+    // By default systemd stops the whole scope when the ceiling kills a process in it, fgate's watcher included.
+    // Newer systemd lets the scope carry on, so the watcher can report what happened; older systemd doesn't know
+    // the setting, and goes without.
+    let mut kept = properties.clone();
+    kept.push("OOMPolicy=continue".to_string());
+    if systemd_user(&kept) {
+        return Some(kept);
+    }
+    systemd_user(&properties).then_some(properties)
 }
 
 #[cfg(target_os = "linux")]

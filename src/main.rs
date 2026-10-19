@@ -141,7 +141,8 @@ fn run(class: gate::Class, command: &[String]) -> ! {
     });
     let ran = ran.elapsed();
     let peak = job.as_deref().map(sys::Job::peak_memory).unwrap_or(0);
-    let hit = job.as_deref().is_some_and(sys::Job::hit_ceiling);
+    let exit_code = status.as_ref().map_or(127, code);
+    let hit = job.as_deref().is_some_and(|job| job.hit_ceiling(exit_code));
     let mut summary = format!("fgate: done in {}", gate::duration(ran));
     if peak > 0 {
         summary += &format!(", peak memory {}", gate::size(peak));
