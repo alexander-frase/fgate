@@ -14,18 +14,28 @@
 //! drops when a process ends however it ends, so nothing is ever left locked by a crashed or killed agent.
 //! Settings: `%LOCALAPPDATA%\fgate\config.txt` (written with defaults on first use).
 
+#[cfg(windows)]
 mod config;
+#[cfg(windows)]
 mod gate;
+#[cfg(windows)]
 mod hook;
+#[cfg(windows)]
 mod job;
+#[cfg(windows)]
 mod watch;
 
+#[cfg(windows)]
 use std::process::{Command, ExitCode};
+#[cfg(windows)]
 use std::sync::{Arc, Mutex};
+#[cfg(windows)]
 use std::time::{Duration, Instant};
 
+#[cfg(windows)]
 use config::Config;
 
+#[cfg(windows)]
 const HELP: &str = "fgate: the build gate (https://github.com/alexander-frase/fgate)
   fgate <command> [args…]      run a build or test command in a build slot (waits its turn)
   fgate --gpu <command> […]    run a GPU program (game, renderer, screenshot script) in the GPU slot
@@ -39,9 +49,11 @@ const HELP: &str = "fgate: the build gate (https://github.com/alexander-frase/fg
       --note <text>              added to every refusal
 Settings: %LOCALAPPDATA%\\fgate\\config.txt, or FGATE_* environment variables.";
 
+#[cfg(windows)]
 /// Set for everything fgate runs: a gated command that starts another `fgate …` already holds a slot.
 const HELD_VAR: &str = "FGATE_HELD";
 
+#[cfg(windows)]
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
@@ -60,6 +72,7 @@ fn main() -> ExitCode {
     }
 }
 
+#[cfg(windows)]
 fn run(class: gate::Class, command: &[String]) -> ! {
     let Some((program, args)) = command.split_first() else {
         eprintln!("fgate: no command given\n{HELP}");
@@ -163,6 +176,7 @@ fn run(class: gate::Class, command: &[String]) -> ! {
     exit(status)
 }
 
+#[cfg(windows)]
 /// Ends fgate with the command's own exit code (Windows codes can be large or negative, such as a crash's).
 fn exit(status: std::io::Result<std::process::ExitStatus>) -> ! {
     match status {
@@ -174,6 +188,7 @@ fn exit(status: std::io::Result<std::process::ExitStatus>) -> ! {
     }
 }
 
+#[cfg(windows)]
 /// The command as the status shows it: the program without its folder, at most 140 characters.
 fn short(command: &[String]) -> String {
     let program = command[0].replace('\\', "/");
@@ -188,3 +203,12 @@ fn short(command: &[String]) -> String {
     }
     line
 }
+
+#[cfg(not(windows))]
+compile_error!(
+    "fgate runs on Windows only for now: it uses Windows job objects and file locks. \
+     Linux and macOS support is planned: https://github.com/alexander-frase/fgate"
+);
+
+#[cfg(not(windows))]
+fn main() {}

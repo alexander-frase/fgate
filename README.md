@@ -1,6 +1,6 @@
 # fgate
 
-**A build gate for coding agents that share one machine.**
+**The fair gate: a build gate for coding agents that share one machine.**
 
 Run five or ten coding agents (Claude Code, or anything else with a shell) on one Windows PC and sooner or
 later they all start `cargo build` at once. Memory fills up, the machine freezes, and builds die with "out of
@@ -22,7 +22,7 @@ fgate hook [options]                a Claude Code hook that refuses cargo comman
 fgate runs on Windows 10/11 and needs Rust 1.87 or newer.
 
 ```sh
-cargo install --git https://github.com/alexander-frase/fgate --locked
+cargo install fgate --locked
 ```
 
 That puts `fgate.exe` in `~/.cargo/bin`. One install serves every project and every agent on the machine.
@@ -150,13 +150,13 @@ Windows won't overwrite a running `fgate.exe`. Rename it first, install, and del
 
 ```sh
 mv ~/.cargo/bin/fgate.exe ~/.cargo/bin/fgate-old.exe
-cargo install --git https://github.com/alexander-frase/fgate --locked
+cargo install fgate --locked
 ```
 
 ## Platform
 
-Windows only for now: the slots use Windows file locks and the ceilings use Windows job objects. Linux (cgroups)
-and macOS would be welcome.
+Windows only for now: the slots use Windows file locks and the ceilings use Windows job objects. On Linux and
+macOS, `cargo install fgate` stops with a message saying so. Support for both is planned.
 
 ## License
 
