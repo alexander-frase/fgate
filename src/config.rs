@@ -29,9 +29,12 @@ pub struct Config {
     pub night_min_free_gb: u32,
     /// Whether the night limits are in force for this command.
     pub night: bool,
+    /// Before a compiling cargo command into a shared target directory, clean the workspace's own packages there
+    /// when another checkout built that profile last (`switch`; 0: off).
+    pub switch_clean: u32,
 }
 
-const KEYS: [&str; 13] = [
+const KEYS: [&str; 14] = [
     "build_slots",
     "gpu_slots",
     "now_slots",
@@ -45,6 +48,7 @@ const KEYS: [&str; 13] = [
     "night_build_slots",
     "night_mem_gb",
     "night_min_free_gb",
+    "switch_clean",
 ];
 
 impl Config {
@@ -69,6 +73,7 @@ impl Config {
             night_mem_gb: 10,
             night_min_free_gb: 8,
             night: false,
+            switch_clean: 1,
         };
         let file = c.file();
         match std::fs::read_to_string(&file) {
@@ -85,6 +90,9 @@ impl Config {
                 }
                 if !text.contains("now_slots") {
                     more += &c.now_text();
+                }
+                if !text.contains("switch_clean") {
+                    more += &c.switch_text();
                 }
                 if !more.is_empty() {
                     let gap = if text.ends_with('\n') { "" } else { "\n" };
@@ -143,6 +151,7 @@ impl Config {
             "night_build_slots" => self.night_build_slots = n as usize,
             "night_mem_gb" => self.night_mem_gb = n,
             "night_min_free_gb" => self.night_min_free_gb = n,
+            "switch_clean" => self.switch_clean = n.min(1),
             // A setting from a newer fgate, or a typo.
             _ => warn(&format!("unknown setting {key}")),
         }
@@ -175,6 +184,16 @@ impl Config {
         )
     }
 
+    fn switch_text(&self) -> String {
+        format!(
+            "# Checkouts sharing one cargo target directory (CARGO_TARGET_DIR): before a build, clean this workspace's\n\
+             # own packages there when another checkout built that profile last, so cargo never reuses its crates\n\
+             # (1 = on, 0 = off):\n\
+             switch_clean = {}\n",
+            self.switch_clean
+        )
+    }
+
     fn write_default(&self, file: &Path) {
         let text = format!(
             "# fgate settings for this machine (https://github.com/alexander-frase/fgate). Every agent reads this file,\n\
@@ -190,7 +209,7 @@ impl Config {
              # Each gated command's memory ceiling in GB, everything it starts together (0 = none):\n\
              mem_gb = {}\n\
              # A second command waits while less than this many GB are free:\n\
-             min_free_gb = {}\n{}{}",
+             min_free_gb = {}\n{}{}{}",
             self.build_slots,
             self.gpu_slots,
             self.jobs,
@@ -198,7 +217,8 @@ impl Config {
             self.mem_gb,
             self.min_free_gb,
             self.night_text(),
-            self.now_text()
+            self.now_text(),
+            self.switch_text()
         );
         let _ = std::fs::create_dir_all(&self.dir);
         let _ = std::fs::write(file, text);
