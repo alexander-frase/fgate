@@ -25,6 +25,19 @@ jobs:
         shell: bash
         run: bash ci/smoke.sh
 
+  # Cargo.toml promises Rust 1.87; build on it everywhere so that promise stays true.
+  msrv:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.87
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --all-targets --locked
+
   # Linux ceilings need a systemd user session; GitHub's Ubuntu machines can start one.
   linux-ceilings:
     runs-on: ubuntu-latest
