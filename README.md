@@ -64,6 +64,28 @@ The command's own output and exit code pass through untouched. A gated command t
 Agents name their place by their folder, or by their worktree for checkouts under `.claude/worktrees/<name>`,
 so the status shows `spaceport-sp1: cargo build` rather than a process id.
 
+## Checkouts sharing one target directory
+
+Agents often work in git worktrees, one checkout each, and build into one shared `CARGO_TARGET_DIR` so the
+dependencies are compiled once. That is safe for the dependencies, but not for the workspace's own crates: cargo
+names their build output by their path relative to the workspace, so every checkout writes to the same files, and it
+judges freshness by file times. When another checkout built more recently, your sources look older than its build
+and cargo reuses it: your program runs another checkout's code, or fails to compile against its API.
+
+So before a compiling cargo command (`build`, `check`, `test`, `run`, `clippy`, `doc`, `bench`, `rustc`) into a
+target directory set by `CARGO_TARGET_DIR` or `--target-dir`, fgate looks at `.fgate-checkouts` in that directory:
+who built this profile last (`debug`, `release`, a custom profile, per target triple). When it was another checkout,
+or nobody is recorded yet, fgate first cleans this workspace's own packages for that profile (`cargo clean -p
+<member> …`; the dependencies stay) and records this checkout:
+
+```text
+fgate: release in E:\code\game\target was last built by another checkout (E:\code\game\.claude\worktrees\a): cleaning
+this workspace's 8 package(s) there first, so cargo doesn't reuse them (switch_clean)
+```
+
+That costs a rebuild of the workspace's crates whenever checkouts take turns, never a rebuild of the dependencies.
+A build into the workspace's own `target/` is left alone. `switch_clean = 0` turns it off.
+
 ## How it works
 
 - **Kinds of slot.** Build slots for `cargo` and test runs, a GPU slot for games, renderers and screenshot
@@ -110,6 +132,7 @@ waiting command reads it again when it changes. `fgate status` shows where the f
 | `night_build_slots` | 1                   | build slots at night                                                    |
 | `night_mem_gb`      | 10                  | memory ceiling at night                                                 |
 | `night_min_free_gb` | 8                   | at night any command waits while less than this is free                 |
+| `switch_clean`      | 1                   | clean a shared target's workspace crates when another checkout built them (0 = off) |
 
 Any setting can be overridden for one command with an environment variable such as `FGATE_MEM_GB=16`.
 `FGATE_DIR` points fgate at another folder, for trying it out without touching the real line.

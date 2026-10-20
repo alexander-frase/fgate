@@ -18,6 +18,7 @@
 mod config;
 mod gate;
 mod hook;
+mod switch;
 mod sys;
 mod watch;
 
@@ -40,6 +41,8 @@ const HELP: &str = "fgate: the build gate (https://github.com/alexander-frase/fg
       --protect-label <name>     refuse `gh` commands that name this label
       --no-admin-merge           refuse `gh pr merge --admin`
       --note <text>              added to every refusal
+A compiling cargo command into a target directory other checkouts share (CARGO_TARGET_DIR) first cleans this
+workspace's own packages there when another checkout built that profile last (switch_clean).
 Settings: config.txt in fgate's folder (`fgate status` shows where), or FGATE_* environment variables.";
 
 /// Set for everything fgate runs: a gated command that starts another `fgate …` already holds a slot.
@@ -81,6 +84,9 @@ fn run(class: gate::Class, command: &[String]) -> ! {
     };
     // Already inside a gated command: run straight away, it owns a slot.
     if std::env::var_os(HELD_VAR).is_some() {
+        if Config::load().switch_clean != 0 {
+            switch::prepare(command);
+        }
         exit(Command::new(program).args(args).status());
     }
 
@@ -91,6 +97,10 @@ fn run(class: gate::Class, command: &[String]) -> ! {
     let waited = waited.elapsed();
     // The settings as they are now: they may have changed while the command waited.
     let config = Config::load();
+    // A target directory shared with other checkouts: their builds of this workspace's crates must not be reused.
+    if config.switch_clean != 0 {
+        switch::prepare(command);
+    }
 
     let mem_gb = config.mem_gb_for(class);
     let mem_bytes = mem_gb as u64 * (1u64 << 30);
