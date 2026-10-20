@@ -77,10 +77,10 @@ impl View {
         }
         self.last_sample = Some(Instant::now());
         let (busy, all) = job::cpu_times();
-        if let Some((b0, a0)) = self.last_cpu
-            && all > a0
-        {
-            push(&mut self.cpu, (busy - b0) as f64 / (all - a0) as f64);
+        if let Some((b0, a0)) = self.last_cpu {
+            if all > a0 {
+                push(&mut self.cpu, (busy - b0) as f64 / (all - a0) as f64);
+            }
         }
         self.last_cpu = Some((busy, all));
         let (total, free) = job::memory();
