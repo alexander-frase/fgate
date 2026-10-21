@@ -32,9 +32,12 @@ pub struct Config {
     /// Before a compiling cargo command into a shared target directory, clean the workspace's own packages there
     /// when another checkout built that profile last (`switch`; 0: off).
     pub switch_clean: u32,
+    /// After a build into a shared target directory, copy the workspace's executables into the checkout's
+    /// `target/fgate-bin/<profile>/` (`switch`; 0: off).
+    pub keep_bins: u32,
 }
 
-const KEYS: [&str; 14] = [
+const KEYS: [&str; 15] = [
     "build_slots",
     "gpu_slots",
     "now_slots",
@@ -49,6 +52,7 @@ const KEYS: [&str; 14] = [
     "night_mem_gb",
     "night_min_free_gb",
     "switch_clean",
+    "keep_bins",
 ];
 
 impl Config {
@@ -74,6 +78,7 @@ impl Config {
             night_min_free_gb: 8,
             night: false,
             switch_clean: 1,
+            keep_bins: 1,
         };
         let file = c.file();
         match std::fs::read_to_string(&file) {
@@ -93,6 +98,9 @@ impl Config {
                 }
                 if !text.contains("switch_clean") {
                     more += &c.switch_text();
+                }
+                if !text.contains("keep_bins") {
+                    more += &c.keep_text();
                 }
                 if !more.is_empty() {
                     let gap = if text.ends_with('\n') { "" } else { "\n" };
@@ -152,6 +160,7 @@ impl Config {
             "night_mem_gb" => self.night_mem_gb = n,
             "night_min_free_gb" => self.night_min_free_gb = n,
             "switch_clean" => self.switch_clean = n.min(1),
+            "keep_bins" => self.keep_bins = n.min(1),
             // A setting from a newer fgate, or a typo.
             _ => warn(&format!("unknown setting {key}")),
         }
@@ -194,6 +203,15 @@ impl Config {
         )
     }
 
+    fn keep_text(&self) -> String {
+        format!(
+            "# After a build into a shared target directory, copy this workspace's executables into the checkout,\n\
+             # target/fgate-bin/<profile>/, where the next checkout's clean can't delete them (1 = on, 0 = off):\n\
+             keep_bins = {}\n",
+            self.keep_bins
+        )
+    }
+
     fn write_default(&self, file: &Path) {
         let text = format!(
             "# fgate settings for this machine (https://github.com/alexander-frase/fgate). Every agent reads this file,\n\
@@ -209,7 +227,7 @@ impl Config {
              # Each gated command's memory ceiling in GB, everything it starts together (0 = none):\n\
              mem_gb = {}\n\
              # A second command waits while less than this many GB are free:\n\
-             min_free_gb = {}\n{}{}{}",
+             min_free_gb = {}\n{}{}{}{}",
             self.build_slots,
             self.gpu_slots,
             self.jobs,
@@ -218,7 +236,8 @@ impl Config {
             self.min_free_gb,
             self.night_text(),
             self.now_text(),
-            self.switch_text()
+            self.switch_text(),
+            self.keep_text()
         );
         let _ = std::fs::create_dir_all(&self.dir);
         let _ = std::fs::write(file, text);

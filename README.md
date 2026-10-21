@@ -86,6 +86,20 @@ this workspace's 8 package(s) there first, so cargo doesn't reuse them (switch_c
 That costs a rebuild of the workspace's crates whenever checkouts take turns, never a rebuild of the dependencies.
 A build into the workspace's own `target/` is left alone. `switch_clean = 0` turns it off.
 
+That clean also deletes the executables a checkout has just built, as soon as another checkout's build gets the
+slot, often before the first agent has run or copied them. So after a build succeeds, while it still holds the slot,
+fgate copies the workspace's executables (its bin targets) into the checkout itself, where no other checkout's build
+touches them:
+
+```text
+fgate: kept game.exe, game_tools.exe (unchanged) in E:\code\game\.claude\worktrees\a\target\fgate-bin\debug: run it
+from there, the shared target's copy goes with the next checkout's build (keep_bins)
+```
+
+It copies only when the record says this checkout built that profile last, so a kept executable is always the
+checkout's own code, and only what changed since the last copy. A kept executable that is running is renamed out of
+the way, which Windows allows, rather than overwritten. `keep_bins = 0` turns it off.
+
 ## How it works
 
 - **Kinds of slot.** Build slots for `cargo` and test runs, a GPU slot for games, renderers and screenshot
@@ -133,6 +147,7 @@ waiting command reads it again when it changes. `fgate status` shows where the f
 | `night_mem_gb`      | 10                  | memory ceiling at night                                                 |
 | `night_min_free_gb` | 8                   | at night any command waits while less than this is free                 |
 | `switch_clean`      | 1                   | clean a shared target's workspace crates when another checkout built them (0 = off) |
+| `keep_bins`         | 1                   | copy a shared build's executables into the checkout's `target/fgate-bin/` (0 = off) |
 
 Any setting can be overridden for one command with an environment variable such as `FGATE_MEM_GB=16`.
 `FGATE_DIR` points fgate at another folder, for trying it out without touching the real line.

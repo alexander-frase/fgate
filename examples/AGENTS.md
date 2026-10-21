@@ -26,5 +26,7 @@ Several agents share this machine. Builds must never run it out of memory, so he
 - **Out of memory?** If fgate ends with "it reached the … GB ceiling", the failure came from the gate's memory
   ceiling, not from the code. Tell the owner instead of changing the code to use less memory.
 - **Shared build folder** (edit or delete): build into the shared target so dependencies aren't compiled again in
-  every checkout: `CARGO_TARGET_DIR=/path/to/main/checkout/target fgate cargo test`.
+  every checkout: `CARGO_TARGET_DIR=/path/to/main/checkout/target fgate cargo test`. Run a program you built from
+  your checkout's `target/fgate-bin/<debug|release>/`, never from the shared target: the next checkout's build
+  cleans that one away.
 - `fgate status` shows the slots and the line; `fgate watch` shows them live.
