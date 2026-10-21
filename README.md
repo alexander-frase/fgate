@@ -241,3 +241,5 @@ A `fgate watch` that is open keeps showing the old version: restart it.
 ## License
 
 [MIT](LICENSE)
+
+Used in my projects at [Vanir Forge](https://vanirforge.com).

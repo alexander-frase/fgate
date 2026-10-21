@@ -34,6 +34,9 @@ const COMPILING: [&str; 14] = [
 /// What a cargo command line says about where and how it builds.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Build {
+    /// The requested cargo executable and optional rustup toolchain, also used by helper commands.
+    cargo: String,
+    toolchain: Option<String>,
     /// `--target-dir` from the command line (the environment's comes later).
     pub target_dir: Option<PathBuf>,
     /// `--manifest-path`, which picks the workspace instead of the current folder.
@@ -43,6 +46,16 @@ pub struct Build {
     /// The output folder within the target directory: `debug`, `release`, a custom profile's name, under the
     /// target triple's folder when one is given.
     pub key: String,
+}
+
+impl Build {
+    fn cargo(&self) -> Command {
+        let mut command = Command::new(&self.cargo);
+        if let Some(toolchain) = &self.toolchain {
+            command.arg(toolchain);
+        }
+        command
+    }
 }
 
 /// The build a command asks for, if it is a compiling cargo command (`cargo +nightly test …`, `cargo.exe b`).
@@ -117,6 +130,8 @@ pub fn parse(command: &[String]) -> Option<Build> {
         None => dir.to_string(),
     };
     Some(Build {
+        cargo: program.clone(),
+        toolchain: command.get(1).filter(|a| a.starts_with('+')).cloned(),
         target_dir,
         manifest,
         flags,
@@ -187,7 +202,7 @@ pub fn prepare(shared: &Shared) {
             members.len()
         ),
     }
-    let mut clean = Command::new("cargo");
+    let mut clean = build.cargo();
     clean.arg("clean");
     for m in &members {
         clean.args(["-p", m]);
@@ -292,7 +307,7 @@ fn copy_if_changed(from: &Path, to: &Path) -> std::io::Result<bool> {
 
 /// The workspace the command builds (its root folder), as cargo finds it.
 fn workspace_root(build: &Build) -> Option<PathBuf> {
-    let mut c = Command::new("cargo");
+    let mut c = build.cargo();
     c.args(["locate-project", "--workspace", "--message-format", "plain"]);
     if let Some(m) = &build.manifest {
         c.arg("--manifest-path").arg(m);
@@ -304,7 +319,7 @@ fn workspace_root(build: &Build) -> Option<PathBuf> {
 
 /// The workspace's own packages, as `cargo metadata --no-deps` describes them.
 fn metadata(build: &Build) -> Option<serde_json::Value> {
-    let mut c = Command::new("cargo");
+    let mut c = build.cargo();
     c.args(["metadata", "--no-deps", "--format-version", "1"]);
     if let Some(m) = &build.manifest {
         c.arg("--manifest-path").arg(m);
@@ -430,6 +445,29 @@ mod tests {
             "cargo",
         ] {
             assert!(parse(&cmd(c)).is_none(), "{c}");
+        }
+    }
+
+    #[test]
+    fn helper_commands_preserve_the_cargo_executable_and_toolchain() {
+        for (input, executable, toolchain) in [
+            ("cargo build", "cargo", None),
+            ("cargo +nightly build", "cargo", Some("+nightly")),
+            (
+                "tools/cargo.exe +1.87.0 test",
+                "tools/cargo.exe",
+                Some("+1.87.0"),
+            ),
+            ("cargo run -- +nightly", "cargo", None),
+        ] {
+            let build = parse(&cmd(input)).unwrap();
+            for subcommand in ["locate-project", "metadata", "clean"] {
+                let mut helper = build.cargo();
+                helper.arg(subcommand);
+                assert_eq!(helper.get_program(), executable);
+                let expected: Vec<_> = toolchain.into_iter().chain([subcommand]).collect();
+                assert_eq!(helper.get_args().collect::<Vec<_>>(), expected);
+            }
         }
     }
 
