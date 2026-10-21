@@ -1,9 +1,9 @@
 #!/bin/bash
 # Uses fgate once on this system against a private folder: status, a gated command and its exit code, a --now
-# command while a build holds the only slot, and the history.
+# command while a build holds the only slot, the history, and two checkouts taking turns in one target directory.
 set -eu
 cargo build --locked -q
-F=target/debug/fgate
+F="$PWD/target/debug/fgate"
 export FGATE_DIR="$(mktemp -d)"
 printf 'build_slots = 1\nmin_free_gb = 0\nnight_min_free_gb = 0\n' > "$FGATE_DIR/config.txt"
 
@@ -25,4 +25,21 @@ wait
 
 "$F" status
 grep -q "	now	" "$FGATE_DIR/history.log" || { echo "no now run in the history"; exit 1; }
+
+# Two checkouts of one workspace share a target directory: each build cleans the other's crates there
+# (switch_clean) and keeps its own executable in its checkout (keep_bins).
+W="$(mktemp -d)"
+for c in a b; do
+    mkdir -p "$W/$c/src"
+    printf '[package]\nname = "app"\nversion = "0.1.0"\nedition = "2021"\n\n[workspace]\n' > "$W/$c/Cargo.toml"
+    printf 'fn main() { println!("checkout %s"); }\n' "$c" > "$W/$c/src/main.rs"
+done
+build() { (cd "$W/$1" && CARGO_TARGET_DIR="$W/shared" "$F" cargo build -q 2>&1); }
+ran() { "$W/$1/target/fgate-bin/debug/app"; }
+build a
+[ "$(ran a)" = "checkout a" ] || { echo "a's build kept no executable of its own"; exit 1; }
+build b
+[ "$(ran a)" = "checkout a" ] || { echo "b's build changed a's kept executable"; exit 1; }
+[ "$(ran b)" = "checkout b" ] || { echo "b's build kept no executable of its own"; exit 1; }
+build b | grep -q "(unchanged)" || { echo "an unchanged executable was copied again"; exit 1; }
 echo "smoke test passed"

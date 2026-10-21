@@ -42,7 +42,9 @@ const HELP: &str = "fgate: the build gate (https://github.com/alexander-frase/fg
       --no-admin-merge           refuse `gh pr merge --admin`
       --note <text>              added to every refusal
 A compiling cargo command into a target directory other checkouts share (CARGO_TARGET_DIR) first cleans this
-workspace's own packages there when another checkout built that profile last (switch_clean).
+workspace's own packages there when another checkout built that profile last (switch_clean). After it, the
+workspace's executables are copied into the checkout, target/fgate-bin/<profile>/, where no other checkout's
+build deletes them (keep_bins).
 Settings: config.txt in fgate's folder (`fgate status` shows where), or FGATE_* environment variables.";
 
 /// Set for everything fgate runs: a gated command that starts another `fgate …` already holds a slot.
@@ -84,10 +86,12 @@ fn run(class: gate::Class, command: &[String]) -> ! {
     };
     // Already inside a gated command: run straight away, it owns a slot.
     if std::env::var_os(HELD_VAR).is_some() {
-        if Config::load().switch_clean != 0 {
-            switch::prepare(command);
-        }
-        exit(Command::new(program).args(args).status());
+        let config = Config::load();
+        let shared = shared(&config, command);
+        prepare(&config, shared.as_ref());
+        let status = Command::new(program).args(args).status();
+        keep(&config, shared.as_ref(), &status);
+        exit(status);
     }
 
     let config = Config::load();
@@ -98,9 +102,8 @@ fn run(class: gate::Class, command: &[String]) -> ! {
     // The settings as they are now: they may have changed while the command waited.
     let config = Config::load();
     // A target directory shared with other checkouts: their builds of this workspace's crates must not be reused.
-    if config.switch_clean != 0 {
-        switch::prepare(command);
-    }
+    let shared = shared(&config, command);
+    prepare(&config, shared.as_ref());
 
     let mem_gb = config.mem_gb_for(class);
     let mem_bytes = mem_gb as u64 * (1u64 << 30);
@@ -173,6 +176,8 @@ fn run(class: gate::Class, command: &[String]) -> ! {
         };
     }
     eprintln!("{summary}");
+    // Before the slot goes to the next build, which may clean these executables away.
+    keep(&config, shared.as_ref(), &status);
     // Gives the slot back (the reporter stops with it).
     if let Ok(mut held) = held.lock() {
         held.take();
@@ -199,6 +204,35 @@ fn run(class: gate::Class, command: &[String]) -> ! {
         job.finish();
     }
     exit(status)
+}
+
+/// The shared target directory `command` builds into, when a setting needs to know it.
+fn shared(config: &Config, command: &[String]) -> Option<switch::Shared> {
+    (config.switch_clean != 0 || config.keep_bins != 0)
+        .then(|| switch::shared(command))
+        .flatten()
+}
+
+/// Cleans another checkout's builds of this workspace away first (switch_clean).
+fn prepare(config: &Config, shared: Option<&switch::Shared>) {
+    if let Some(s) = shared {
+        if config.switch_clean != 0 {
+            switch::prepare(s);
+        }
+    }
+}
+
+/// Keeps the executables of a build that succeeded (keep_bins).
+fn keep(
+    config: &Config,
+    shared: Option<&switch::Shared>,
+    status: &std::io::Result<std::process::ExitStatus>,
+) {
+    if let Some(s) = shared {
+        if config.keep_bins != 0 && status.as_ref().is_ok_and(|s| s.success()) {
+            switch::keep(s);
+        }
+    }
 }
 
 /// Ends fgate with the command's own exit code (Windows codes can be large or negative, such as a crash's).
