@@ -8,7 +8,7 @@ fgate makes them take turns. Each heavy command waits in a fair line for a free 
 priority, within a memory and CPU ceiling. `fgate watch` shows the whole thing live. It runs on Windows, Linux and
 macOS.
 
-![fgate watch: one build and one GPU run in their slots, five commands waiting in line, and the recent runs](docs/fgate-watch.png)
+![fgate watch: three builds and four GPU runs in their slots with their newest output, the machine's memory and CPU, and the recent runs](docs/fgate-watch.png)
 
 ```text
 fgate cargo test -p my_crate        waits for a build slot, then runs the command unchanged
