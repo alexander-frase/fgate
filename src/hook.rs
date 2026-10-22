@@ -1,4 +1,5 @@
-//! The Claude Code hook (PreToolUse on Bash and PowerShell): a cargo build, check, test, clippy or run started
+//! The agent hook for Claude Code and GitHub Copilot (PreToolUse on Bash and PowerShell): a cargo build, check,
+//! test, clippy or run, or a C++ build (`cmake --build`, `ctest`, `ninja`, `make`, `msbuild`, `conan build`) started
 //! without `fgate` in front is refused with the command to use instead. Agents keep their usual commands and only
 //! add the prefix. A project adds its own rules on the hook's command line (in its `.claude/settings.json`):
 //!
@@ -18,6 +19,60 @@ const HEAVY: &[&str] = &[
     "build", "b", "check", "c", "test", "t", "clippy", "run", "r", "bench", "doc", "d", "install",
     "nextest", "rustc", "rustdoc", "llvm-cov", "miri", "fix",
 ];
+
+/// C++ build tools that compile or run tests whatever their arguments, unless one of `LIGHT` is among them.
+const BUILDERS: &[&str] = &[
+    "ninja",
+    "make",
+    "mingw32-make",
+    "gmake",
+    "nmake",
+    "jom",
+    "msbuild",
+    "devenv",
+    "ctest",
+];
+
+/// Arguments that make a build tool only report something or clean up.
+const LIGHT: &[&str] = &[
+    "--version",
+    "-version",
+    "/version",
+    "--help",
+    "-h",
+    "/?",
+    "-t",
+    "-N",
+    "--show-only",
+    "-n",
+    "--dry-run",
+    "--just-print",
+    "clean",
+];
+
+/// `uv run` options followed by a value, which isn't the program.
+const UV_VALUED: &[&str] = &[
+    "--with",
+    "--with-editable",
+    "--with-requirements",
+    "-p",
+    "--python",
+    "--package",
+    "--project",
+    "--directory",
+    "--env-file",
+    "--extra",
+    "--group",
+    "--only-group",
+    "--no-group",
+    "--index",
+    "--python-platform",
+    "-C",
+    "--config-setting",
+];
+
+/// Conan commands that compile something.
+const CONAN_HEAVY: &[&str] = &["build", "create", "test"];
 
 /// Words that may stand in front of the command itself.
 const PREFIXES: &[&str] = &[
@@ -121,15 +176,17 @@ pub fn run(args: &[String]) -> ExitCode {
     let Ok(call) = serde_json::from_str::<serde_json::Value>(&input) else {
         return ExitCode::SUCCESS;
     };
-    let Some(command) = call.pointer("/tool_input/command").and_then(|c| c.as_str()) else {
+    let Some((command, copilot)) = command_of(&call) else {
         return ExitCode::SUCCESS;
     };
+    let command = command.as_str();
     let Some(need) = ungated(command, &rules) else {
         return ExitCode::SUCCESS;
     };
     let mut reason = match need {
         Need::Build => "Builds on this machine wait their turn through the build gate. Put `fgate` right before \
-             `cargo`, for example `fgate cargo test`. fgate waits for a free build slot and prints its place in line, \
+             the build command, for example `fgate cargo test`, `fgate cmake --build build` or \
+             `fgate uv run conan build ..`. fgate waits for a free build slot and prints its place in line, \
              then runs the command unchanged. If `fgate status` shows a line, run the command in the background \
              (run_in_background) so the wait doesn't hit the tool's time limit."
             .to_string(),
@@ -152,15 +209,35 @@ pub fn run(args: &[String]) -> ExitCode {
     if let Some(note) = &rules.note {
         reason = format!("{reason} {note}");
     }
-    let answer = serde_json::json!({
-        "hookSpecificOutput": {
-            "hookEventName": "PreToolUse",
-            "permissionDecision": "deny",
-            "permissionDecisionReason": reason,
-        }
-    });
+    let answer = if copilot {
+        serde_json::json!({ "permissionDecision": "deny", "permissionDecisionReason": reason })
+    } else {
+        serde_json::json!({
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": reason,
+            }
+        })
+    };
     println!("{answer}");
     ExitCode::SUCCESS
+}
+
+/// The shell command of a tool call, and whether it came in Copilot CLI's own `preToolUse` format
+/// (`toolArgs`, a JSON string or object) rather than Claude Code's (`tool_input`), which VS Code and Copilot CLI's
+/// `PreToolUse` also use.
+fn command_of(call: &serde_json::Value) -> Option<(String, bool)> {
+    if let Some(command) = call.pointer("/tool_input/command").and_then(|c| c.as_str()) {
+        return Some((command.to_string(), false));
+    }
+    let args = call.get("toolArgs")?;
+    let args = match args.as_str() {
+        Some(text) => serde_json::from_str(text).ok()?,
+        None => args.clone(),
+    };
+    let command = args.get("command")?.as_str()?;
+    Some((command.to_string(), true))
 }
 
 /// What a shell command starts without the gate, if anything.
@@ -182,9 +259,25 @@ pub fn ungated(command: &str, rules: &Rules) -> Option<Need> {
                 break;
             }
         }
-        let Some(program) = words.next() else {
+        let Some(mut program) = words.next() else {
             continue;
         };
+        // `uv run <program>` runs the program in the project's environment: look at the program.
+        if program_name(program) == "uv" && words.next_if(|w| *w == "run").is_some() {
+            let mut found = None;
+            while let Some(w) = words.next() {
+                if UV_VALUED.contains(&w) {
+                    words.next();
+                } else if !w.starts_with('-') {
+                    found = Some(w);
+                    break;
+                }
+            }
+            match found {
+                Some(w) => program = w,
+                None => continue,
+            }
+        }
         let name = program_name(program);
         if name == "fgate" {
             continue;
@@ -225,6 +318,25 @@ pub fn ungated(command: &str, rules: &Rules) -> Option<Need> {
         } else if name == "cargo" {
             let sub = words.find(|w| !w.starts_with('-') && !w.starts_with('+'));
             if sub.is_some_and(|s| HEAVY.contains(&s)) {
+                return Some(Need::Build);
+            }
+        } else if name == "cmake" {
+            let rest: Vec<&str> = words.collect();
+            if rest.iter().any(|w| *w == "--build" || *w == "--workflow")
+                && !rest.contains(&"clean")
+            {
+                return Some(Need::Build);
+            }
+        } else if BUILDERS.contains(&name.as_str()) {
+            if !words.any(|w| LIGHT.contains(&w)) {
+                return Some(Need::Build);
+            }
+        } else if name == "conan" {
+            let sub = words.find(|w| !w.starts_with('-'));
+            // `conan install --build=missing` compiles the dependencies it has no binaries for.
+            if sub.is_some_and(|s| CONAN_HEAVY.contains(&s))
+                || sub == Some("install") && words.any(|w| w.starts_with("--build") || w == "-b")
+            {
                 return Some(Need::Build);
             }
         } else if rules.gpu.contains(&name) {
@@ -368,6 +480,56 @@ mod tests {
     }
 
     #[test]
+    fn plain_cpp_builds_are_caught() {
+        let ungated = |c| ungated(c, &none());
+        for command in [
+            "cmake --build build --config Release -j 8",
+            "cd build && cmake --build . --target app_tests 2>&1 | tail -30",
+            "& C:/tools/cmake/bin/cmake.exe --build out",
+            "cmake --workflow --preset ci",
+            "ctest --test-dir build --output-on-failure",
+            "ninja -C build",
+            "make -j8 all",
+            "MSBuild.exe app.sln /p:Configuration=Release",
+            "conan build .. -pr:a euler --build=missing",
+            "uv run conan build ../.. -of .",
+            "uv run --frozen conan create . --build=missing",
+            "uv run --with rich -p 3.12 conan build .",
+            "cmake --build build --clean-first",
+            "cmake --build build -t app_tests",
+            "conan install . --build=missing -of build",
+            "conan install . -b missing",
+        ] {
+            assert_eq!(ungated(command), Some(Need::Build), "{command}");
+        }
+    }
+
+    #[test]
+    fn light_cpp_commands_pass() {
+        let ungated = |c| ungated(c, &none());
+        for command in [
+            "cmake -S . -B build -G Ninja",
+            "cmake --preset default",
+            "cmake --version && ninja --version",
+            "ninja -C build -t targets",
+            "ctest -N --test-dir build",
+            "make clean",
+            "make -n all && ninja -C build -n",
+            "cmake --build build --target clean",
+            "uv run --with conan python tools/report.py",
+            "conan install . -of build",
+            "conan profile detect; conan list '*'",
+            "uv run conan --version",
+            "uv run python wheel/make_wheel.py --lib-dir conan_build/release/lib",
+            "fgate cmake --build build",
+            "fgate uv run conan build ../.. -of .",
+            "git commit -m \"make ninja build pass\"",
+        ] {
+            assert_eq!(ungated(command), None, "{command}");
+        }
+    }
+
+    #[test]
     fn gpu_programs_are_caught_when_named() {
         let rules = project();
         assert_eq!(
@@ -411,6 +573,19 @@ mod tests {
             None
         );
         assert_eq!(ungated("ls target/debug/my_game.exe"), None);
+    }
+
+    #[test]
+    fn commands_are_read_in_both_formats() {
+        let claude = serde_json::json!({"tool_name": "Bash", "tool_input": {"command": "ctest"}});
+        assert_eq!(command_of(&claude), Some(("ctest".into(), false)));
+        let copilot =
+            serde_json::json!({"toolName": "bash", "toolArgs": "{\"command\":\"ninja\"}"});
+        assert_eq!(command_of(&copilot), Some(("ninja".into(), true)));
+        let parsed = serde_json::json!({"toolName": "powershell", "toolArgs": {"command": "make"}});
+        assert_eq!(command_of(&parsed), Some(("make".into(), true)));
+        let edit = serde_json::json!({"toolName": "edit", "toolArgs": "{\"path\":\"a.cpp\"}"});
+        assert_eq!(command_of(&edit), None);
     }
 
     #[test]

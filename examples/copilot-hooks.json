@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "hooks": {
+    "preToolUse": [
+      {
+        "type": "command",
+        "command": "fgate hook --note \"The rules for building are in your instructions.\"",
+        "timeoutSec": 10
+      }
+    ]
+  }
+}

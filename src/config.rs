@@ -13,7 +13,7 @@ pub struct Config {
     pub now_slots: usize,
     /// The memory ceiling of each `fgate --now` command.
     pub now_mem_gb: u32,
-    /// `CARGO_BUILD_JOBS` for a gated cargo command that doesn't set its own.
+    /// `CARGO_BUILD_JOBS` and `CMAKE_BUILD_PARALLEL_LEVEL` for a gated command that doesn't set its own.
     pub jobs: u32,
     /// Each gated command's share of all CPU threads, a hard ceiling (0 or 100: none).
     pub cpu_percent: u32,
@@ -220,7 +220,7 @@ impl Config {
              build_slots = {}\n\
              # GPU runs at once (games, renderers, screenshot scripts):\n\
              gpu_slots = {}\n\
-             # Compiler jobs for each gated cargo command (CARGO_BUILD_JOBS) unless it sets its own:\n\
+             # Compiler jobs for each gated cargo or cmake command (CARGO_BUILD_JOBS, CMAKE_BUILD_PARALLEL_LEVEL) unless it sets its own:\n\
              jobs = {}\n\
              # Each gated command's hard CPU ceiling, percent of all threads (0 = none):\n\
              cpu_percent = {}\n\

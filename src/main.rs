@@ -5,7 +5,7 @@
 //! fgate --gpu <program> …              the GPU slot: games, renderers, screenshot scripts
 //! fgate status                         who holds the slots, who is waiting
 //! fgate watch                          the same, live, with memory, CPU and recent runs
-//! fgate hook [options]                 the Claude Code hook: refuses ungated cargo (and GPU) commands
+//! fgate hook [options]                 the agent hook: refuses ungated cargo, C++ (and GPU) commands
 //! ```
 //!
 //! A waiting command keeps its place in a fair line and prints where it stands. Once it has a slot, the
@@ -35,7 +35,7 @@ const HELP: &str = "fgate: the build gate (https://github.com/alexander-frase/fg
                                ceiling (now_mem_gb); one that needs more belongs in the line
   fgate status                 show the slots and the line
   fgate watch                  a live view of the slots, the line and recent runs (Ctrl+C ends it)
-  fgate hook [options]         Claude Code PreToolUse hook (reads the tool call on stdin)
+  fgate hook [options]         agent hook for Claude Code and Copilot (reads the tool call on stdin)
       --gpu a,b                  programs that must run under `fgate --gpu`
       --protect-branch <name>    refuse `git push` to this branch
       --protect-label <name>     refuse `gh` commands that name this label
@@ -113,8 +113,13 @@ fn run(class: gate::Class, command: &[String]) -> ! {
     }
     let job = job.map(Arc::new);
     child.env(HELD_VAR, class.name());
-    if class != gate::Class::Gpu && std::env::var_os("CARGO_BUILD_JOBS").is_none() {
-        child.env("CARGO_BUILD_JOBS", config.jobs.to_string());
+    if class != gate::Class::Gpu {
+        // cargo's and CMake's compiler jobs, unless the command sets its own.
+        for var in ["CARGO_BUILD_JOBS", "CMAKE_BUILD_PARALLEL_LEVEL"] {
+            if std::env::var_os(var).is_none() {
+                child.env(var, config.jobs.to_string());
+            }
+        }
     }
     eprintln!(
         "fgate: {} slot {} {}{}— {}",
