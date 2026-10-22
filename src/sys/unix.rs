@@ -597,7 +597,7 @@ pub fn console_size() -> (usize, usize) {
     unsafe {
         let mut size: libc::winsize = std::mem::zeroed();
         if libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut size) != 0 || size.ws_col == 0 {
-            return (100, 40);
+            return super::fallback_size();
         }
         (size.ws_col as usize, size.ws_row.max(1) as usize)
     }

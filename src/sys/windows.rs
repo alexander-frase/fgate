@@ -312,7 +312,7 @@ pub fn console_size() -> (usize, usize) {
     unsafe {
         let mut info: CONSOLE_SCREEN_BUFFER_INFO = std::mem::zeroed();
         if GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &mut info) == 0 {
-            return (100, 40);
+            return super::fallback_size();
         }
         let w = info.srWindow;
         (

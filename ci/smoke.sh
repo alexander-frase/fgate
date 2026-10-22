@@ -26,6 +26,10 @@ wait
 "$F" status
 grep -q "	now	" "$FGATE_DIR/history.log" || { echo "no now run in the history"; exit 1; }
 
+# Output that goes to a pipe is passed on unchanged and kept for `fgate peek`, also after the run.
+[ "$("$F" sh -c 'echo kept-line; echo err-line >&2' 2>/dev/null)" = "kept-line" ] || { echo "output not passed on"; exit 1; }
+"$F" peek "$(basename "$PWD")" | grep -q "err-line" || { echo "peek showed no kept output"; exit 1; }
+
 # Two checkouts of one workspace share a target directory: each build cleans the other's crates there
 # (switch_clean) and keeps its own executable in its checkout (keep_bins).
 W="$(mktemp -d)"

@@ -29,6 +29,16 @@ pub struct Usage {
 /// Set when `fgate watch` is asked to end (Ctrl+C, the window closing); see `catch_quit`.
 pub static QUIT: AtomicBool = AtomicBool::new(false);
 
+/// The terminal's size when the system can't tell (not a terminal): `COLUMNS` and `LINES` if set, else 100 × 40.
+fn fallback_size() -> (usize, usize) {
+    let var = |name: &str| {
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+    };
+    (var("COLUMNS").unwrap_or(100), var("LINES").unwrap_or(40))
+}
+
 /// Where fgate keeps its settings, slots, line and history when `FGATE_DIR` doesn't say.
 pub fn settings_dir() -> std::path::PathBuf {
     default_dir().join("fgate")

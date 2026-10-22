@@ -195,6 +195,8 @@ impl Held {
 pub struct Entry {
     /// Since when it holds the slot or waits (Unix seconds).
     pub since: u64,
+    /// The fgate process that holds the slot or waits.
+    pub pid: u32,
     pub place: String,
     pub command: String,
     /// What a holder's job uses, once it has said.
@@ -205,7 +207,7 @@ impl Entry {
     fn parse(text: &str) -> Entry {
         let mut lines = text.lines();
         let since = lines.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-        let _pid = lines.next();
+        let pid = lines.next().and_then(|s| s.parse().ok()).unwrap_or(0);
         let place = lines.next().unwrap_or("?").to_string();
         let command = lines.next().unwrap_or("?").to_string();
         let usage = lines.next().and_then(|l| {
@@ -222,6 +224,7 @@ impl Entry {
         });
         Entry {
             since,
+            pid,
             place,
             command,
             usage,
@@ -263,6 +266,41 @@ pub struct Done {
     pub code: i32,
 }
 
+impl Done {
+    /// One tab-separated line, as the history keeps it (without the line end).
+    pub fn line(&self) -> String {
+        let clean = |s: &str| s.replace(['\t', '\n', '\r'], " ");
+        format!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            self.ended,
+            self.class,
+            clean(&self.place),
+            clean(&self.command),
+            self.ran.as_secs(),
+            self.waited.as_secs(),
+            self.peak,
+            self.code
+        )
+    }
+
+    pub fn parse(line: &str) -> Option<Done> {
+        let f: Vec<&str> = line.split('\t').collect();
+        if f.len() < 8 {
+            return None;
+        }
+        Some(Done {
+            ended: f[0].parse().ok()?,
+            class: f[1].to_string(),
+            place: f[2].to_string(),
+            command: f[3].to_string(),
+            ran: Duration::from_secs(f[4].parse().ok()?),
+            waited: Duration::from_secs(f[5].parse().ok()?),
+            peak: f[6].parse().ok()?,
+            code: f[7].parse().ok()?,
+        })
+    }
+}
+
 fn history_path(config: &Config) -> PathBuf {
     config.dir.join("history.log")
 }
@@ -270,18 +308,7 @@ fn history_path(config: &Config) -> PathBuf {
 /// Adds a finished command to the history (tab-separated, newest last), kept to its last few hundred lines.
 pub fn record(config: &Config, done: &Done) {
     let path = history_path(config);
-    let clean = |s: &str| s.replace(['\t', '\n', '\r'], " ");
-    let line = format!(
-        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
-        done.ended,
-        done.class,
-        clean(&done.place),
-        clean(&done.command),
-        done.ran.as_secs(),
-        done.waited.as_secs(),
-        done.peak,
-        done.code
-    );
+    let line = done.line() + "\n";
     if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&path) {
         let _ = file.write_all(line.as_bytes());
     }
@@ -296,26 +323,7 @@ pub fn record(config: &Config, done: &Done) {
 /// The last `n` finished commands, newest first.
 pub fn history(config: &Config, n: usize) -> Vec<Done> {
     let text = fs::read_to_string(history_path(config)).unwrap_or_default();
-    text.lines()
-        .rev()
-        .filter_map(|l| {
-            let f: Vec<&str> = l.split('\t').collect();
-            if f.len() < 8 {
-                return None;
-            }
-            Some(Done {
-                ended: f[0].parse().ok()?,
-                class: f[1].to_string(),
-                place: f[2].to_string(),
-                command: f[3].to_string(),
-                ran: Duration::from_secs(f[4].parse().ok()?),
-                waited: Duration::from_secs(f[5].parse().ok()?),
-                peak: f[6].parse().ok()?,
-                code: f[7].parse().ok()?,
-            })
-        })
-        .take(n)
-        .collect()
+    text.lines().rev().filter_map(Done::parse).take(n).collect()
 }
 
 /// A place in line.

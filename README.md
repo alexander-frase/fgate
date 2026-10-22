@@ -8,15 +8,16 @@ fgate makes them take turns. Each heavy command waits in a fair line for a free 
 priority, within a memory and CPU ceiling. `fgate watch` shows the whole thing live. It runs on Windows, Linux and
 macOS.
 
-![fgate watch: one build and one GPU run in their slots, five commands waiting in line, and the recent runs](docs/fgate-watch.png)
+![fgate watch: three builds and four GPU runs in their slots with their newest output, the machine's memory and CPU, and the recent runs](docs/fgate-watch.png)
 
 ```text
 fgate cargo test -p my_crate        waits for a build slot, then runs the command unchanged
 fgate --gpu my_game.exe --shots     waits for the GPU slot (games, renderers, screenshot scripts)
 fgate --now cargo publish           skips the line: small commands, within a small memory ceiling
 fgate status                        who holds the slots, who is waiting
-fgate watch                         the same, live: memory, CPU, each job's usage, recent runs
-fgate hook [options]                a Claude Code hook that refuses cargo commands without fgate
+fgate watch                         the same, live: memory, CPU, each job's usage and output, recent runs
+fgate peek [name]                   a running job's output as it comes, or how a finished run ended
+fgate hook [options]                an agent hook (Claude Code, Copilot) that refuses cargo and C++ builds without fgate
 ```
 
 ## Install
@@ -64,6 +65,31 @@ The command's own output and exit code pass through untouched. A gated command t
 Agents name their place by their folder, or by their worktree for checkouts under `.claude/worktrees/<name>`,
 so the status shows `spaceport-sp1: cargo build` rather than a process id.
 
+### Seeing what a job is doing: `fgate peek`
+
+An agent's command writes its output into the agent's shell, where nobody else sees it. When fgate's own output goes
+to a pipe or a file like that, fgate passes the command's output on unchanged and keeps its last 200 lines in its
+folder. `fgate watch` shows each running job's newest line under it, and `fgate peek` follows one:
+
+```text
+$ fgate peek geothermal
+── geothermal · build slot 0 · cargo test --workspace -j 4 · running 1m02s
+   Compiling terrain v0.3.0 (E:\code\game\.claude\worktrees\geothermal\crates\terrain)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 58.40s
+     Running unittests src\lib.rs (target\debug\deps\terrain-6c0f3d5e8a1b2c47.exe)
+test erosion::keeps_rivers ... FAILED
+...
+── ended after 1m08s · exit 101
+```
+
+The name is the checkout's name, as `watch` shows it; `fgate peek gpu 1` picks a slot, and `fgate peek` alone the only
+running job. After a run ends, its last 40 lines stay with the last 50 runs, so `fgate peek geothermal` still shows how
+it ended.
+
+Output that goes to a terminal is left alone, with its colours and progress bars: whoever sits there sees it already.
+Lines come from both streams in the order they came, without colour codes. A Python script's output shows as it is
+printed, because fgate sets `PYTHONUNBUFFERED=1` unless the command sets its own. `capture = 0` turns it off.
+
 ## Checkouts sharing one target directory
 
 Agents often work in git worktrees, one checkout each, and build into one shared `CARGO_TARGET_DIR` so the
@@ -100,6 +126,19 @@ It copies only when the record says this checkout built that profile last, so a 
 checkout's own code, and only what changed since the last copy. A kept executable that is running is renamed out of
 the way, which Windows allows, rather than overwritten. `keep_bins = 0` turns it off.
 
+## After `cargo publish`
+
+`cargo publish` and `cargo package` check the package by building a copy of it in `target/package/<name>-<version>/`,
+into the same target directory and under the same names as the workspace's own build. Afterwards cargo's records point
+at the copy's sources, which never change, so a later `cargo build` takes the published version for fresh and stops
+rebuilding the binary, however the real sources change. So after a gated publish or package that succeeds (and
+verified), fgate cleans the workspace's own packages, and the next build compiles the real sources:
+
+```text
+fgate: cleaned this workspace's 1 package(s) after the verify build, so the next cargo build compiles from the real
+sources, not the packaged copy
+```
+
 ## How it works
 
 - **Kinds of slot.** Build slots for `cargo` and test runs, a GPU slot for games, renderers and screenshot
@@ -113,7 +152,10 @@ the way, which Windows allows, rather than overwritten. `keep_bins = 0` turns it
   within one memory ceiling and a CPU ceiling for the whole process tree, and ended together, so no compiler is
   left running on its own. If the job hits its memory ceiling, fgate says so, so an "out of memory" from the gate
   isn't mistaken for a bug in your code. How each system does it is under [Platforms](#platforms).
-- **Compiler jobs.** A gated cargo command gets `CARGO_BUILD_JOBS` from the settings, unless it sets its own.
+- **Compiler jobs.** A gated command gets `CARGO_BUILD_JOBS` and `CMAKE_BUILD_PARALLEL_LEVEL` from the settings,
+  unless it sets its own. CMake's applies to `cmake --build`; `ninja` or `make` run directly take only their own
+  `-j`, and Ninja uses every thread without it. (`conan build` passes its own `-j` from `tools.build:jobs`; set
+  that in Conan's `global.conf` to match.)
 - **Night limits.** Between `night_from` and `night_until` (local time) stricter limits apply, for agents that
   keep working while nobody watches.
 - **History.** Finished commands are logged to `history.log` in fgate's folder (last 300). `fgate watch`
@@ -137,7 +179,7 @@ waiting command reads it again when it changes. `fgate status` shows where the f
 | `gpu_slots`         | 1                   | GPU runs at once                                                        |
 | `now_slots`         | 4                   | small `--now` commands at once                                          |
 | `now_mem_gb`        | 2                   | each `--now` command's memory ceiling                                   |
-| `jobs`              | 6                   | `CARGO_BUILD_JOBS` for a gated cargo command that doesn't set its own   |
+| `jobs`              | 6                   | `CARGO_BUILD_JOBS` and `CMAKE_BUILD_PARALLEL_LEVEL` for a gated command |
 | `cpu_percent`       | 40                  | each command's hard CPU ceiling, percent of all threads (0 = none)      |
 | `mem_gb`            | 40% of RAM, min 8   | each command's memory ceiling, its whole process tree (0 = none)        |
 | `min_free_gb`       | 6                   | a second command waits while less than this is free                     |
@@ -148,6 +190,7 @@ waiting command reads it again when it changes. `fgate status` shows where the f
 | `night_min_free_gb` | 8                   | at night any command waits while less than this is free                 |
 | `switch_clean`      | 1                   | clean a shared target's workspace crates when another checkout built them (0 = off) |
 | `keep_bins`         | 1                   | copy a shared build's executables into the checkout's `target/fgate-bin/` (0 = off) |
+| `capture`           | 1                   | keep a job's last output lines for `peek` and `watch`, unless it goes to a terminal (0 = off) |
 
 Any setting can be overridden for one command with an environment variable such as `FGATE_MEM_GB=16`.
 `FGATE_DIR` points fgate at another folder, for trying it out without touching the real line.
@@ -156,11 +199,14 @@ Any setting can be overridden for one command with an environment variable such 
 did. What worked: `build_slots = 1`, `jobs = 16`, `cpu_percent = 0`, `mem_gb = 12`, `min_free_gb = 6`. Guard
 memory first. If a build hits its memory ceiling, lower `jobs` before adding slots.
 
-## The Claude Code hook
+## The agent hook
 
 Agents forget the prefix. `fgate hook` is a [PreToolUse hook](https://docs.claude.com/en/docs/claude-code/hooks)
-that refuses a heavy cargo command (`build`, `check`, `test`, `clippy`, `run`, `doc`, `install`, `nextest`, …)
-started without `fgate`, and tells the agent the command to use instead. The agent retries with the prefix. Quoted
+for Claude Code and GitHub Copilot (see [Setting it up for every project](#setting-it-up-for-every-project)) that
+refuses a heavy cargo command (`build`, `check`, `test`, `clippy`, `run`, `doc`, `install`, `nextest`, …) or C++
+build (`cmake --build`, `ctest`, `ninja`, `make`, `msbuild`, `conan build`/`create`/`test`, `conan install --build`,
+also behind `uv run`) started without `fgate`, and tells the agent the command to use instead. Configuring
+(`cmake -S . -B build`) and `--version`/`clean` runs go through. The agent retries with the prefix. Quoted
 text and heredocs don't count, so `git commit -m "cargo test passes"` goes through.
 
 Add it to the project's `.claude/settings.json` (or to `~/.claude/settings.json` for every project;
@@ -201,6 +247,33 @@ Agents use fgate when their instructions say so. Copy the section in [examples/A
 into your project's `AGENTS.md` or `CLAUDE.md`, and the hook settings in
 [examples/settings.json](examples/settings.json) into `.claude/settings.json`. The instructions mean agents get it
 right the first time, and the hook catches the ones that forget.
+
+## Setting it up for every project
+
+fgate counts slots per machine, so the natural place for the hook and the instructions is your user profile, not each
+repository: every project on the machine is covered, and no project's files change. Each agent needs two things, the
+hook and a few lines of instructions ([examples/user-instructions.md](examples/user-instructions.md) has a section
+for cargo and C++ builds).
+
+| Agent                                       | Hook                                                                    | Instructions                         |
+| ------------------------------------------- | ----------------------------------------------------------------------- | ------------------------------------ |
+| Claude Code (also VS Code's Claude target)  | `~/.claude/settings.json`, as [above](#the-agent-hook)                  | `~/.claude/CLAUDE.md`                |
+| GitHub Copilot: VS Code, CLI and the app    | `~/.copilot/hooks/fgate.json`, from [examples/copilot-hooks.json](examples/copilot-hooks.json) | `~/.copilot/copilot-instructions.md` |
+
+On Windows `~` is `%USERPROFILE%`. The Copilot surfaces share one runtime and one hook folder, so the one file covers
+them all. It sends Copilot's own `preToolUse` format (`toolName`, `toolArgs`); fgate reads it and answers in it. The
+user `~/.claude/settings.json` is not read by Copilot, so an agent of each kind needs its own hook file.
+
+Copilot cloud agent runs in GitHub's sandbox, not on your machine, so it has no use for fgate.
+
+Check the hook by handing it a tool call:
+
+```sh
+echo '{"tool_input":{"command":"cmake --build build"}}' | fgate hook                          # Claude Code
+echo '{"toolName":"bash","toolArgs":"{\"command\":\"cmake --build build\"}"}' | fgate hook   # Copilot
+```
+
+Both print a `deny` with the reason; a command fgate lets through prints nothing.
 
 ## Updating fgate while agents use it
 
