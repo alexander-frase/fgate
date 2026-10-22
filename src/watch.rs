@@ -2,9 +2,10 @@
 //! line of output, who waits, the machine's memory and CPU, and the last commands that ran. It only reads what the
 //! gate keeps on disk, so it can be started and stopped at any time without touching anyone's place.
 //!
-//! The screen is drawn as panels on a dark background. From `WIDE` columns, the jobs, the line and the recent runs
-//! fill a column on the left and the machine and the limits sit in a sidebar on the right; narrower, the machine
-//! panel goes on top. Each frame is built whole as a grid of cells and written over the last one.
+//! The screen is drawn as panels on a dark background, under a header that sums up the gate in a few chips (how
+//! many run and wait, free memory, recent failures). From `WIDE` columns the jobs and the recent runs fill a column
+//! on the left, and the machine, the line and the limits sit in a sidebar on the right; narrower, the machine goes on
+//! top and the line follows the jobs. Each frame is built whole as a grid of cells and written over the last one.
 
 use std::collections::{HashMap, VecDeque};
 use std::io::Write;
@@ -13,20 +14,24 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use crate::config::Config;
-use crate::gate::{self, CLASSES, Class, Entry};
+use crate::gate::{self, CLASSES, Class, Done, Entry};
 use crate::output;
 use crate::sys::{self as job, QUIT};
 
 /// How often the view redraws.
 const FRAME: Duration = Duration::from_millis(250);
-/// CPU and memory samples kept for the sparklines (one a second): enough to fill a wide terminal.
+/// CPU and memory samples kept for the graphs (one a second): enough to fill a wide terminal.
 const HISTORY: usize = 150;
-/// The checkout-name column.
+/// The widest checkout-name column.
 const PLACE: usize = 20;
-/// From this many columns, the machine and the limits go into a sidebar.
+/// From this many columns, the machine, the line and the limits go into a sidebar.
 const WIDE: usize = 122;
 /// The sidebar's width.
 const SIDEBAR: usize = 38;
+/// The command column of the recent runs keeps at least this much room; other columns go first.
+const COMMAND_ROOM: usize = 40;
+/// How far back the header counts failed runs.
+const FAILED_WITHIN: u64 = 600;
 const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
 type Rgb = (u8, u8, u8);
@@ -37,8 +42,8 @@ const PANEL: Rgb = (19, 25, 33);
 const STRIPE: Rgb = (24, 31, 41);
 const TEXT: Rgb = (218, 226, 235);
 const MUTED: Rgb = (139, 156, 175);
-/// The empty part of a gauge.
-const TRACK: Rgb = (72, 84, 102);
+/// The empty part of a meter or graph.
+const TRACK: Rgb = (58, 68, 84);
 const ACCENT: Rgb = (255, 140, 60);
 const GREEN: Rgb = (90, 220, 130);
 const AMBER: Rgb = (245, 195, 70);
@@ -46,21 +51,57 @@ const RED: Rgb = (245, 90, 90);
 const CYAN: Rgb = (95, 200, 235);
 const VIOLET: Rgb = (186, 164, 235);
 const NIGHT: Rgb = (150, 140, 255);
+/// Memory and CPU turn amber, then red, at these shares.
+const MEMORY_LEVELS: (f64, f64) = (0.7, 0.88);
+const CPU_LEVELS: (f64, f64) = (0.6, 0.85);
+const JOB_LEVELS: (f64, f64) = (0.75, 0.92);
 
-/// How a piece of text is drawn: its colour, and whether bold.
+/// How a piece of text is drawn: its colour, whether bold, and a background of its own (a chip), if any.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct Ink {
     fg: Rgb,
     bold: bool,
+    bg: Option<Rgb>,
 }
 
 const fn ink(fg: Rgb) -> Ink {
-    Ink { fg, bold: false }
+    Ink {
+        fg,
+        bold: false,
+        bg: None,
+    }
 }
 
 const fn bold(fg: Rgb) -> Ink {
-    Ink { fg, bold: true }
+    Ink {
+        fg,
+        bold: true,
+        bg: None,
+    }
 }
+
+/// Text on a background of its own: `color` tinted for a state, or muted on a plain chip.
+fn chip(color: Option<Rgb>) -> Ink {
+    match color {
+        Some(c) => Ink {
+            fg: c,
+            bold: true,
+            bg: Some(blend(c, BASE, 0.16)),
+        },
+        None => Ink {
+            fg: MUTED,
+            bold: false,
+            bg: Some(STRIPE),
+        },
+    }
+}
+
+/// A key or command, drawn like a keycap.
+const KEYCAP: Ink = Ink {
+    fg: TEXT,
+    bold: true,
+    bg: Some(STRIPE),
+};
 
 /// Pieces of text in their inks, making one row.
 type Spans = Vec<(Ink, String)>;
@@ -102,6 +143,18 @@ struct View {
     jobs: HashMap<(String, u64), (u64, Instant, f64)>,
     /// Why there are no memory and CPU ceilings on this system, if there aren't (asked once).
     no_ceilings: Option<Option<String>>,
+}
+
+/// What one frame shows, read once.
+struct State {
+    slots: Vec<(Class, Vec<Option<Entry>>)>,
+    waiting: Vec<(Class, Entry)>,
+    total: u64,
+    free: u64,
+    /// Less memory free than a second job needs.
+    low: bool,
+    /// Waiters are held for memory, not for a slot.
+    held: bool,
 }
 
 impl View {
@@ -160,22 +213,42 @@ impl View {
             .iter()
             .flat_map(|&c| gate::line(config, c).into_iter().map(move |e| (c, e)))
             .collect();
-        let busy = slots.iter().any(|(_, s)| s.iter().any(Option::is_some));
+        let running = slots
+            .iter()
+            .map(|(_, s)| s.iter().filter(|h| h.is_some()).count())
+            .sum::<usize>();
         let (total, free) = job::memory();
         let low = free < config.min_free_gb as u64 * (1 << 30);
+        let state = State {
+            held: !waiting.is_empty() && low && (config.night || running > 0),
+            slots,
+            waiting,
+            total,
+            free,
+            low,
+        };
+        let now = gate::now();
+        let history = gate::history(config, rows);
+        let failed = history
+            .iter()
+            .filter(|d| d.code != 0 && now.saturating_sub(d.ended) <= FAILED_WITHIN)
+            .count();
 
-        // Header: name and what it is on the left, version, limits and clock on the right.
+        // Header: the gate at a glance on the left, the limits in force and the clock on the right.
         let margin = 2;
         let inner = cols - 2 * margin;
-        let pulse = if busy && tick % 4 < 2 { ACCENT } else { MUTED };
+        let pulse = if running > 0 && tick % 4 < 2 {
+            ACCENT
+        } else {
+            MUTED
+        };
         let mut l = Line::new(inner);
         l.push(ink(pulse), "◆ ");
         l.push(bold(ACCENT), "fgate");
-        l.right(
-            ink(MUTED),
-            &format!("BUILD GATE  {}", env!("CARGO_PKG_VERSION")),
-        );
-        f.spans(margin, 1, inner, &l.done());
+        l.push(ink(TEXT), "   ");
+        for (ink, text) in summary(running, state.waiting.len(), free, low, failed) {
+            l.push(ink, &text);
+        }
         let (h, m, s) = job::local_time();
         let mode = if config.night {
             (
@@ -185,129 +258,118 @@ impl View {
         } else {
             (AMBER, "● day limits".to_string())
         };
-        let mut l = Line::new(inner);
-        l.push(
-            ink(MUTED),
-            "Coding agents take turns for builds, within memory and CPU ceilings.",
-        );
         l.right_many(&[
             (ink(mode.0), &mode.1),
             (ink(MUTED), "   "),
             (ink(TEXT), &format!("{h:02}:{m:02}:{s:02}")),
         ]);
-        f.spans(margin, 2, inner, &l.done());
+        f.spans(margin, 1, inner, &l.done());
 
-        // Footer: what else there is, and where the settings are.
+        // Footer: what else there is, the version, and where the settings are.
         let mut l = Line::new(inner);
         for (key, what) in [
-            ("fgate peek <name>", " follow a job's output"),
-            ("fgate status", " the same, once, as text"),
-            ("Ctrl+C", " close"),
+            ("fgate peek <name>", "follow a job's output"),
+            ("fgate status", "print it once"),
+            ("Ctrl+C", "close"),
         ] {
-            l.push(bold(TEXT), key);
-            l.push(ink(MUTED), &format!("{what}    "));
+            l.push(KEYCAP, &format!(" {key} "));
+            l.push(ink(MUTED), &format!(" {what}    "));
+        }
+        let version = format!("fgate {}", env!("CARGO_PKG_VERSION"));
+        if l.width + width_of(&version) <= inner {
+            l.right(ink(MUTED), &version);
         }
         f.spans(margin, rows - 2, inner, &l.done());
-        let mut l = Line::new(inner);
-        l.push(ink(MUTED), "settings  ");
-        l.push(ink(MUTED), &config.file().display().to_string());
-        f.spans(margin, rows - 1, inner, &l.done());
+        let settings = format!("settings  {}", config.file().display());
+        if width_of(&settings) <= inner {
+            f.spans(margin, rows - 1, inner, &[(ink(MUTED), settings)]);
+        }
 
         // The body, between them.
-        let top = 4;
+        let top = 3;
         let height = rows.saturating_sub(top + 3);
+        let bottom = top + height;
         let wide = cols >= WIDE;
-        let (left, mut y) = if wide {
-            let left = inner - SIDEBAR - 2;
-            self.sidebar(
+        let left = if wide {
+            let w = inner - SIDEBAR - 2;
+            let side = Area::new(margin + w + 2, top, SIDEBAR, height);
+            self.sidebar(&mut f, config, &state, side);
+            Area::new(margin, top, w, height)
+        } else {
+            let used = self.machine_across(
                 &mut f,
                 config,
-                Area::new(margin + left + 2, top, SIDEBAR, height),
-                low,
-                total,
-                free,
+                &state,
+                Area::new(margin, top, inner, height),
             );
-            (Area::new(margin, top, left, height), top)
-        } else {
-            let a = Area::new(margin, top, inner, height);
-            let used = self.machine_wide(&mut f, config, a, low, total, free);
-            (
-                Area::new(
-                    margin,
-                    top + used + 1,
-                    inner,
-                    height.saturating_sub(used + 1),
-                ),
+            Area::new(
+                margin,
                 top + used + 1,
+                inner,
+                height.saturating_sub(used + 1),
             )
         };
-        let bottom = left.y + left.h;
+        let w = left.w - 4;
 
-        // A panel for each kind of slot (`now` only while one runs), then the line.
+        // A panel for each kind of slot (`now` only while one runs); the line too when there is no sidebar.
         let mut panels: Vec<(&str, Spans, Rows)> = Vec::new();
-        for (class, holders) in &slots {
+        for (class, holders) in &state.slots {
             let taken = holders.iter().filter(|h| h.is_some()).count();
             if *class == Class::Now && taken == 0 {
                 continue;
             }
-            let mut rows = Vec::new();
+            let mut rows = Rows::new();
             let mut stripe = false;
             for (i, holder) in holders.iter().enumerate() {
-                match holder {
-                    None if *class == Class::Now => {}
-                    None => {
-                        let mut l = Line::new(left.w - 4);
-                        l.push(ink(GREEN), "○ ");
-                        l.push(ink(MUTED), &format!("slot {i}  free"));
-                        rows.push((l.done(), PANEL));
-                    }
-                    Some(e) => {
-                        let latest = output::kept(config, *class, i, e)
-                            .and_then(|k| k.latest().map(str::to_string));
-                        let mem_gb = config.mem_gb_for(*class);
-                        let ceiling = if mem_gb > 0 {
-                            mem_gb as u64 * (1 << 30)
-                        } else {
-                            total
-                        };
-                        let share = e
-                            .usage
-                            .and_then(|u| self.job_cpu((e.place.clone(), e.since), u.cpu));
-                        let bg = if stripe { STRIPE } else { PANEL };
-                        stripe = !stripe;
-                        for row in
-                            holder_rows(e, i, tick, ceiling, share, latest.as_deref(), left.w - 4)
-                        {
-                            rows.push((row, bg));
-                        }
-                    }
+                let Some(e) = holder else {
+                    continue;
+                };
+                let latest =
+                    output::kept(config, *class, i, e).and_then(|k| k.latest().map(str::to_string));
+                let mem_gb = config.mem_gb_for(*class);
+                let ceiling = if mem_gb > 0 {
+                    mem_gb as u64 * (1 << 30)
+                } else {
+                    total
+                };
+                let share = e
+                    .usage
+                    .and_then(|u| self.job_cpu((e.place.clone(), e.since), u.cpu));
+                let bg = if stripe { STRIPE } else { PANEL };
+                stripe = !stripe;
+                for row in holder_rows(e, i, tick, ceiling, share, latest.as_deref(), w) {
+                    rows.push((row, bg));
                 }
             }
-            let status = vec![(ink(MUTED), format!("{taken} of {} in use", holders.len()))];
+            if *class != Class::Now {
+                if let Some(row) = free_row(holders, w) {
+                    rows.push((row, PANEL));
+                }
+            }
+            let mut status = vec![(
+                ink(if taken > 0 { TEXT } else { MUTED }),
+                format!("{taken}/{} busy", holders.len()),
+            )];
+            let waiters = state.waiting.iter().filter(|(c, _)| c == class).count();
+            if waiters > 0 {
+                status.push((ink(AMBER), format!(" · {waiters} waiting")));
+            }
             panels.push((class.name(), status, rows));
         }
-        let mut status = Spans::new();
-        if waiting.is_empty() {
-            status.push((ink(MUTED), "nobody waiting".into()));
-        } else {
-            status.push((ink(AMBER), format!("{} waiting", waiting.len())));
-            if (config.night || busy) && low {
-                status.push((
-                    ink(RED),
-                    format!(" · held for memory (needs {} GB free)", config.min_free_gb),
-                ));
-            }
+        if !wide {
+            let queue = state
+                .waiting
+                .iter()
+                .enumerate()
+                .map(|(n, (class, e))| (waiting_row(n, *class, e, w), PANEL))
+                .collect();
+            panels.push(("line", line_status(&state, config), queue));
         }
-        let queue = waiting
-            .iter()
-            .enumerate()
-            .map(|(n, (class, e))| (waiting_row(n, *class, e, left.w - 4), PANEL))
-            .collect();
-        panels.push(("line", status, queue));
 
-        // Room is kept for the recent runs: one gap row between panels when there is enough.
+        // One gap row between panels when there is room to spare for the recent runs.
         let wanted: usize = panels.iter().map(|(_, _, r)| r.len() + 2).sum();
         let gap = usize::from(wanted + panels.len() + 6 <= left.h);
+        let mut y = left.y;
         for (title, status, rows) in &panels {
             let room = bottom.saturating_sub(y);
             if room < 2 {
@@ -321,21 +383,26 @@ impl View {
         // What ran last, as much as fits.
         let room = bottom.saturating_sub(y);
         if room >= 4 {
-            let done = gate::history(config, room - 3);
-            let mut rows = vec![(recent_heading(left.w - 4), PANEL)];
+            let done = &history[..history.len().min(room - 3)];
+            let cols = RecentColumns::fit(done, w);
+            let mut rows = vec![(recent_heading(&cols, w), PANEL)];
             if done.is_empty() {
-                let mut l = Line::new(left.w - 4);
-                l.push(ink(MUTED), "nothing yet");
-                rows.push((l.done(), PANEL));
+                rows.push((vec![(ink(MUTED), "nothing yet".to_string())], PANEL));
             }
-            let now = gate::now();
             for (i, d) in done.iter().enumerate() {
-                let bg = if i % 2 == 1 { STRIPE } else { PANEL };
-                rows.push((recent_row(d, now, left.w - 4), bg));
+                let bg = if d.code != 0 {
+                    blend(RED, PANEL, 0.12)
+                } else if i % 2 == 1 {
+                    STRIPE
+                } else {
+                    PANEL
+                };
+                rows.push((recent_row(d, now, &cols, w), bg));
             }
-            let status = vec![(ink(MUTED), format!("last {}", done.len()))];
+            let status = vec![(ink(MUTED), format!("{} runs", done.len()))];
+            let h = (rows.len() + 2).min(room);
             f.panel(
-                Area::new(left.x, y, left.w, room),
+                Area::new(left.x, y, left.w, h),
                 "recent",
                 &status,
                 ACCENT,
@@ -345,45 +412,44 @@ impl View {
         f
     }
 
-    /// The sidebar: the machine's memory and CPU with their history, then the limits.
-    fn sidebar(
-        &mut self,
-        f: &mut Frame,
-        config: &Config,
-        a: Area,
-        low: bool,
-        total: u64,
-        free: u64,
-    ) {
+    /// The sidebar: the machine's memory and CPU with their history, the line, then the limits.
+    fn sidebar(&mut self, f: &mut Frame, config: &Config, state: &State, a: Area) {
         let w = a.w - 4;
-        let used = total.saturating_sub(free);
-        let frac = used as f64 / total.max(1) as f64;
+        let bottom = a.y + a.h;
+        let used = state.total.saturating_sub(state.free);
+        let frac = used as f64 / state.total.max(1) as f64;
         let cpu = self.cpu.back().copied().unwrap_or(0.0);
-        let bar = w.saturating_sub(7 + 9);
         let mut rows = Vec::new();
 
         let mut l = Line::new(w);
-        l.push(ink(MUTED), "memory ");
-        l.bar(frac, bar, level(frac, 0.7, 0.88));
-        l.right(ink(TEXT), &gate::size(used));
+        l.push(ink(MUTED), "memory");
+        l.right(
+            ink(TEXT),
+            &format!("{} / {}", gate::size(used), gate::size(state.total)),
+        );
         rows.push(l.done());
         let mut l = Line::new(w);
-        l.push(ink(MUTED), &sparkline(&self.memory, w));
+        l.meter(frac, w, MEMORY_LEVELS);
         rows.push(l.done());
+        rows.extend(graph(&self.memory, w, MEMORY_LEVELS));
         let mut l = Line::new(w);
         l.push(
-            ink(if low { RED } else { MUTED }),
-            &format!("{} free of {}", gate::size(free), gate::size(total)),
+            ink(if state.low { RED } else { MUTED }),
+            &format!("{} free", gate::size(state.free)),
         );
+        l.right(ink(MUTED), &format!("last {}", span(w)));
         rows.push(l.done());
         rows.push(Spans::new());
         let mut l = Line::new(w);
-        l.push(ink(MUTED), "cpu    ");
-        l.bar(cpu, bar, level(cpu, 0.6, 0.85));
+        l.push(ink(MUTED), "cpu");
         l.right(ink(TEXT), &format!("{:.0}%", cpu * 100.0));
         rows.push(l.done());
         let mut l = Line::new(w);
-        l.push(ink(CYAN), &sparkline(&self.cpu, w));
+        l.meter(cpu, w, CPU_LEVELS);
+        rows.push(l.done());
+        rows.extend(graph(&self.cpu, w, CPU_LEVELS));
+        let mut l = Line::new(w);
+        l.right(ink(MUTED), &format!("last {}", span(w)));
         rows.push(l.done());
 
         let threads = std::thread::available_parallelism().map_or(0, |n| n.get());
@@ -397,28 +463,51 @@ impl View {
             VIOLET,
             &rows,
         );
+        let mut y = a.y + h + 1;
 
-        let y = a.y + h + 1;
-        if y + 3 > a.y + a.h {
-            return;
+        // The line: each waiter's place, name and wait, then its command.
+        let mut queue = Rows::new();
+        if state.held {
+            let mut l = Line::new(w);
+            l.push(
+                ink(RED),
+                &format!("held: needs {} GB free", config.min_free_gb),
+            );
+            queue.push((l.done(), PANEL));
         }
-        let rows: Rows = self
-            .limits(config)
-            .into_iter()
-            .map(|(key, value)| {
-                let mut l = Line::new(w);
-                l.push(ink(MUTED), &format!("{key:<12}"));
-                l.push(ink(TEXT), &value);
-                (l.done(), PANEL)
-            })
-            .collect();
-        let status = if config.night {
-            vec![(ink(NIGHT), format!("night until {}:00", config.night_until))]
-        } else {
-            vec![(ink(AMBER), "day".to_string())]
-        };
-        let h = (rows.len() + 2).min(a.y + a.h - y);
-        f.panel(Area::new(a.x, y, a.w, h), "limits", &status, VIOLET, &rows);
+        for (n, (class, e)) in state.waiting.iter().enumerate() {
+            let bg = if n % 2 == 1 { STRIPE } else { PANEL };
+            for row in queue_rows(n, *class, e, w) {
+                queue.push((row, bg));
+            }
+        }
+        if bottom.saturating_sub(y) >= 2 {
+            let h = (queue.len() + 2).min(bottom - y);
+            f.panel(
+                Area::new(a.x, y, a.w, h),
+                "line",
+                &line_status(state, config),
+                VIOLET,
+                &queue,
+            );
+            y += h + 1;
+        }
+
+        // The limits, last: they rarely change.
+        if bottom.saturating_sub(y) >= 3 {
+            let rows: Rows = self
+                .limits(config)
+                .into_iter()
+                .map(|(key, value)| {
+                    let mut l = Line::new(w);
+                    l.push(ink(MUTED), &format!("{key:<12}"));
+                    l.push(ink(TEXT), &value);
+                    (l.done(), PANEL)
+                })
+                .collect();
+            let h = (rows.len() + 2).min(bottom - y);
+            f.panel(Area::new(a.x, y, a.w, h), "limits", &[], VIOLET, &rows);
+        }
     }
 
     /// The limits in force, as (what, value).
@@ -450,44 +539,41 @@ impl View {
     }
 
     /// The machine across the top, for narrower terminals: memory and CPU with their history, and the limits on
-    /// one line. Says how many rows it took.
-    fn machine_wide(
-        &mut self,
-        f: &mut Frame,
-        config: &Config,
-        a: Area,
-        low: bool,
-        total: u64,
-        free: u64,
-    ) -> usize {
+    /// one row. Says how many rows it took.
+    fn machine_across(&mut self, f: &mut Frame, config: &Config, state: &State, a: Area) -> usize {
         let w = a.w - 4;
-        let used = total.saturating_sub(free);
-        let frac = used as f64 / total.max(1) as f64;
+        let used = state.total.saturating_sub(state.free);
+        let frac = used as f64 / state.total.max(1) as f64;
         let cpu = self.cpu.back().copied().unwrap_or(0.0);
         let gauge = (w / 3).clamp(10, 36);
         let mut rows = Vec::new();
 
         let mut l = Line::new(w);
         l.push(ink(MUTED), "memory ");
-        l.bar(frac, gauge, level(frac, 0.7, 0.88));
+        l.meter(frac, gauge, MEMORY_LEVELS);
         l.push(
             ink(TEXT),
-            &format!("  {} / {}", gate::size(used), gate::size(total)),
+            &format!("  {} / {}", gate::size(used), gate::size(state.total)),
         );
         l.push(
-            ink(if low { RED } else { MUTED }),
-            &format!("  {} free", gate::size(free)),
+            ink(if state.low { RED } else { MUTED }),
+            &format!("  {} free", gate::size(state.free)),
         );
-        let spark = w.saturating_sub(l.width + 3).min(HISTORY);
-        l.right(ink(MUTED), &sparkline(&self.memory, spark));
+        let spark = w.saturating_sub(l.width + 12).min(HISTORY);
+        l.right_many(&[
+            (ink(MUTED), &sparkline(&self.memory, spark)),
+            (ink(MUTED), &format!("  {:>7}", span(spark))),
+        ]);
         rows.push(l.done());
 
         let mut l = Line::new(w);
         l.push(ink(MUTED), "cpu    ");
-        l.bar(cpu, gauge, level(cpu, 0.6, 0.85));
+        l.meter(cpu, gauge, CPU_LEVELS);
         l.push(ink(TEXT), &format!("  {:>3.0}%", cpu * 100.0));
-        let spark = w.saturating_sub(l.width + 3).min(HISTORY);
-        l.right(ink(CYAN), &sparkline(&self.cpu, spark));
+        l.right_many(&[
+            (ink(CYAN), &sparkline(&self.cpu, spark)),
+            (ink(MUTED), &format!("  {:>7}", span(spark))),
+        ]);
         rows.push(l.done());
 
         // The limits, short enough for one row.
@@ -521,6 +607,62 @@ impl View {
         );
         h
     }
+}
+
+/// The header's chips: how many run and wait, free memory, and recent failures (only when there are some).
+fn summary(running: usize, waiting: usize, free: u64, low: bool, failed: usize) -> Spans {
+    let mut chips = vec![
+        (format!("{running} running"), (running > 0).then_some(GREEN)),
+        (format!("{waiting} waiting"), (waiting > 0).then_some(AMBER)),
+        (format!("{} free", gate::size(free)), low.then_some(RED)),
+    ];
+    if failed > 0 {
+        chips.push((
+            format!("{failed} failed in {} min", FAILED_WITHIN / 60),
+            Some(RED),
+        ));
+    }
+    let mut spans = Spans::new();
+    for (text, color) in chips {
+        spans.push((chip(color), format!(" {text} ")));
+        spans.push((ink(TEXT), " ".to_string()));
+    }
+    spans
+}
+
+/// The line panel's status: how many wait.
+fn line_status(state: &State, config: &Config) -> Spans {
+    if state.waiting.is_empty() {
+        return vec![(ink(MUTED), "nobody waiting".to_string())];
+    }
+    let mut status = vec![(ink(AMBER), format!("{} waiting", state.waiting.len()))];
+    if state.held {
+        status.push((
+            ink(RED),
+            format!(" · held for {} GB free", config.min_free_gb),
+        ));
+    }
+    status
+}
+
+/// The free slots of a kind, on one row: `○ 0  ○ 1  free`.
+fn free_row(holders: &[Option<Entry>], width: usize) -> Option<Spans> {
+    let free: Vec<usize> = holders
+        .iter()
+        .enumerate()
+        .filter(|(_, h)| h.is_none())
+        .map(|(i, _)| i)
+        .collect();
+    if free.is_empty() {
+        return None;
+    }
+    let mut l = Line::new(width);
+    for i in free {
+        l.push(ink(GREEN), "○ ");
+        l.push(ink(MUTED), &format!("{i}  "));
+    }
+    l.push(ink(MUTED), "free");
+    Some(l.done())
 }
 
 /// A slot's holder: who and how long, the command, what its job uses, and its newest line of output when kept.
@@ -567,7 +709,7 @@ fn holder_rows(
             let frac = now as f64 / ceiling.max(1) as f64;
             let mut l = Line::new(width);
             l.push(ink(MUTED), "  mem ");
-            l.bar(frac, (width / 4).clamp(8, 27), level(frac, 0.75, 0.92));
+            l.meter(frac, (width / 4).clamp(8, 27), JOB_LEVELS);
             l.push(
                 ink(TEXT),
                 &format!("  {} of {}", gate::size(now), gate::size(ceiling)),
@@ -576,7 +718,7 @@ fn holder_rows(
             if let Some(share) = share {
                 l.push(ink(MUTED), "  cpu ");
                 l.push(
-                    ink(level(share, 0.6, 0.85)),
+                    ink(level(share, CPU_LEVELS)),
                     &format!("{:.0}%", share * 100.0),
                 );
             }
@@ -597,7 +739,7 @@ fn holder_rows(
     rows
 }
 
-/// A place in line: its number, class and checkout, how long it has waited, then the command.
+/// A place in line on one row (no sidebar): its number, class and checkout, how long it has waited, the command.
 fn waiting_row(n: usize, class: Class, e: &Entry, width: usize) -> Spans {
     let mut l = Line::new(width);
     l.push(ink(AMBER), &format!("{:>2} ", n + 1));
@@ -611,55 +753,141 @@ fn waiting_row(n: usize, class: Class, e: &Entry, width: usize) -> Spans {
     l.done()
 }
 
-/// The recent runs' column names, over `recent_row`'s columns.
-fn recent_heading(width: usize) -> Spans {
+/// A place in line in the sidebar, on two rows: number, class, checkout and wait, then the command.
+fn queue_rows(n: usize, class: Class, e: &Entry, width: usize) -> [Spans; 2] {
     let mut l = Line::new(width);
-    l.push(
-        ink(MUTED),
-        &format!(
-            "{:>7}   {:<6}{:<PLACE$} {:>6} {:>8}  {:<13}  {}",
-            "WHEN", "CLASS", "CHECKOUT", "RAN", "PEAK", "RESULT", "COMMAND"
-        ),
-    );
-    l.done()
-}
-
-/// A finished run: when, how it ended, its class and checkout, run time and peak memory, the exit code or the
-/// wait, then the command, which takes the rest of the width.
-fn recent_row(d: &gate::Done, now: u64, width: usize) -> Spans {
-    let mut l = Line::new(width);
-    let ago = Duration::from_secs(now.saturating_sub(d.ended));
-    l.push(
-        ink(MUTED),
-        &format!("{:>7} ", format!("{} ago", short_age(ago))),
-    );
-    if d.code == 0 {
-        l.push(ink(GREEN), "✓ ");
-    } else {
-        l.push(ink(RED), "✗ ");
-    }
-    l.push(ink(MUTED), &format!("{:<6}", d.class));
+    l.push(ink(AMBER), &format!("{:>2} ", n + 1));
+    l.push(ink(MUTED), &format!("{:<6}", class.name()));
+    let wait = gate::duration(e.age());
     l.push(
         ink(CYAN),
-        &format!("{:<PLACE$} ", clip(&d.place, PLACE - 1)),
+        &clip(
+            &e.place,
+            width.saturating_sub(l.width + width_of(&wait) + 1),
+        ),
     );
-    let peak = if d.peak > 0 {
-        gate::size(d.peak)
-    } else {
-        String::new()
-    };
+    l.right(ink(AMBER), &wait);
+    let first = l.done();
+    let mut l = Line::new(width);
     l.push(
         ink(MUTED),
-        &format!("{:>6} {:>8}  ", gate::duration(d.ran), peak),
+        &format!("   {}", clip(&e.command, width.saturating_sub(3))),
     );
-    let (note, color) = if d.code != 0 {
+    [first, l.done()]
+}
+
+/// Which columns the recent runs show, and how wide, for the rows shown and the room there is: the checkout and
+/// the result as wide as their longest, and the class, then the peak, left out before the command gets too
+/// little room.
+#[derive(Debug, PartialEq, Eq)]
+struct RecentColumns {
+    class: bool,
+    peak: bool,
+    place: usize,
+    /// 0: no row has a result to show, and the column is left out.
+    note: usize,
+}
+
+impl RecentColumns {
+    fn fit(runs: &[Done], width: usize) -> RecentColumns {
+        let place = runs
+            .iter()
+            .map(|d| width_of(&d.place))
+            .max()
+            .unwrap_or(0)
+            .clamp(8, PLACE);
+        let note = runs.iter().map(|d| width_of(&note(d).0)).max().unwrap_or(0);
+        let mut cols = RecentColumns {
+            class: true,
+            peak: true,
+            place,
+            note: if note > 0 { note.max(6) } else { 0 },
+        };
+        if width.saturating_sub(cols.fixed()) < COMMAND_ROOM {
+            cols.class = false;
+        }
+        if width.saturating_sub(cols.fixed()) < COMMAND_ROOM {
+            cols.peak = false;
+        }
+        cols
+    }
+
+    /// The columns before the command.
+    fn fixed(&self) -> usize {
+        5 + 2
+            + if self.class { 6 } else { 0 }
+            + self.place
+            + 1
+            + 6
+            + if self.peak { 9 } else { 0 }
+            + 2
+            + if self.note > 0 { self.note + 2 } else { 0 }
+    }
+}
+
+/// A run's result to show: its exit code when it failed, how long it waited when that was long enough to say.
+fn note(d: &Done) -> (String, Rgb) {
+    if d.code != 0 {
         (format!("exit {}", d.code), RED)
     } else if d.waited.as_secs() >= 1 {
         (format!("waited {}", gate::duration(d.waited)), MUTED)
     } else {
         (String::new(), MUTED)
-    };
-    l.push(ink(color), &format!("{note:<13}  "));
+    }
+}
+
+/// The recent runs' column names, over `recent_row`'s columns.
+fn recent_heading(cols: &RecentColumns, width: usize) -> Spans {
+    let mut text = format!("{:>4}   ", "WHEN");
+    if cols.class {
+        text += &format!("{:<6}", "CLASS");
+    }
+    text += &format!("{:<w$} {:>6}", "CHECKOUT", "RAN", w = cols.place);
+    if cols.peak {
+        text += &format!("{:>9}", "PEAK");
+    }
+    text += "  ";
+    if cols.note > 0 {
+        text += &format!("{:<w$}  ", "RESULT", w = cols.note);
+    }
+    text += "COMMAND";
+    let mut l = Line::new(width);
+    l.push(ink(MUTED), &text);
+    l.done()
+}
+
+/// A finished run: how long ago, how it ended, its class and checkout, run time and peak memory, the exit code or
+/// the wait, then the command, which takes the rest of the width.
+fn recent_row(d: &Done, now: u64, cols: &RecentColumns, width: usize) -> Spans {
+    let mut l = Line::new(width);
+    let ago = Duration::from_secs(now.saturating_sub(d.ended));
+    l.push(ink(MUTED), &format!("{:>4} ", short_age(ago)));
+    if d.code == 0 {
+        l.push(ink(GREEN), "✓ ");
+    } else {
+        l.push(bold(RED), "✗ ");
+    }
+    if cols.class {
+        l.push(ink(MUTED), &format!("{:<6}", d.class));
+    }
+    l.push(
+        ink(TEXT),
+        &format!("{:<w$} ", clip(&d.place, cols.place), w = cols.place),
+    );
+    l.push(ink(MUTED), &format!("{:>6}", gate::duration(d.ran)));
+    if cols.peak {
+        let peak = if d.peak > 0 {
+            gate::size(d.peak)
+        } else {
+            String::new()
+        };
+        l.push(ink(MUTED), &format!("{peak:>9}"));
+    }
+    l.push(ink(MUTED), "  ");
+    if cols.note > 0 {
+        let (text, color) = note(d);
+        l.push(ink(color), &format!("{text:<w$}  ", w = cols.note));
+    }
     l.push(ink(TEXT), &clip(&d.command, width.saturating_sub(l.width)));
     l.done()
 }
@@ -672,7 +900,7 @@ fn push(history: &mut VecDeque<f64>, value: f64) {
 }
 
 /// Green, amber or red for a share, by its two thresholds.
-fn level(frac: f64, warn: f64, bad: f64) -> Rgb {
+fn level(frac: f64, (warn, bad): (f64, f64)) -> Rgb {
     if frac >= bad {
         RED
     } else if frac >= warn {
@@ -682,7 +910,7 @@ fn level(frac: f64, warn: f64, bad: f64) -> Rgb {
     }
 }
 
-/// The last `n` samples as a sparkline.
+/// The last `n` samples as a one-row sparkline.
 fn sparkline(history: &VecDeque<f64>, n: usize) -> String {
     const BARS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
     history
@@ -692,9 +920,56 @@ fn sparkline(history: &VecDeque<f64>, n: usize) -> String {
         .collect()
 }
 
+/// The last `n` samples as a graph two rows tall (top row first), newest on the right, each column coloured by its
+/// level. Columns without a sample yet, and empty ones, show a flat baseline.
+fn graph(history: &VecDeque<f64>, n: usize, levels: (f64, f64)) -> [Spans; 2] {
+    const BARS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    let mut top = Line::new(n);
+    let mut low = Line::new(n);
+    let shown: Vec<f64> = history
+        .iter()
+        .skip(history.len().saturating_sub(n))
+        .copied()
+        .collect();
+    for _ in shown.len()..n {
+        top.push(ink(TRACK), " ");
+        low.push(ink(TRACK), "▁");
+    }
+    for v in shown {
+        let eighths = (v * 16.0).round() as usize;
+        let color = if eighths == 0 {
+            TRACK
+        } else {
+            level(v, levels)
+        };
+        let lower = match eighths {
+            0 => '▁',
+            1..=8 => BARS[eighths - 1],
+            _ => '█',
+        };
+        let upper = if eighths > 8 {
+            BARS[(eighths - 9).min(7)]
+        } else {
+            ' '
+        };
+        top.push(ink(color), &upper.to_string());
+        low.push(ink(color), &lower.to_string());
+    }
+    [top.done(), low.done()]
+}
+
+/// The time `n` one-second samples cover: `34s`, `2 min`.
+fn span(n: usize) -> String {
+    if n < 120 {
+        format!("{n}s")
+    } else {
+        format!("{} min", n / 60)
+    }
+}
+
 /// At most `n` columns, with an ellipsis where it was cut.
 fn clip(text: &str, n: usize) -> String {
-    if width(text) <= n {
+    if width_of(text) <= n {
         return text.to_string();
     }
     let mut out = String::new();
@@ -743,11 +1018,12 @@ fn cell_width(c: char) -> usize {
     }
 }
 
-fn width(text: &str) -> usize {
+/// How many terminal columns a text takes.
+fn width_of(text: &str) -> usize {
     text.chars().map(cell_width).sum()
 }
 
-/// One row of a panel: pieces of text in their inks, cut at the row's width.
+/// One row of a panel: pieces of text in their inks, cut at the row's width. Pieces in the same ink are joined.
 struct Line {
     spans: Spans,
     width: usize,
@@ -779,7 +1055,10 @@ impl Line {
             used += w;
         }
         self.width += used;
-        self.spans.push((ink, cut));
+        match self.spans.last_mut() {
+            Some((last, text)) if *last == ink => text.push_str(&cut),
+            _ => self.spans.push((ink, cut)),
+        }
     }
 
     /// A piece set against the right edge.
@@ -788,7 +1067,7 @@ impl Line {
     }
 
     fn right_many(&mut self, pieces: &[(Ink, &str)]) {
-        let len: usize = pieces.iter().map(|(_, p)| width(p)).sum();
+        let len: usize = pieces.iter().map(|(_, p)| width_of(p)).sum();
         // When the row is full, the pieces are cut at the edge instead.
         let gap = self.max.saturating_sub(self.width + len);
         self.push(ink(TEXT), &" ".repeat(gap));
@@ -797,19 +1076,23 @@ impl Line {
         }
     }
 
-    /// A gauge `cells` wide, filled to `frac` in eighths of a cell.
-    fn bar(&mut self, frac: f64, cells: usize, color: Rgb) {
-        const EIGHTHS: [char; 8] = [' ', '▏', '▎', '▍', '▌', '▋', '▊', '▉'];
-        let eighths = (frac.clamp(0.0, 1.0) * cells as f64 * 8.0).round() as usize;
-        let full = eighths / 8;
-        let mut filled = "█".repeat(full);
-        let mut rest = cells - full;
-        if full < cells && !eighths.is_multiple_of(8) {
-            filled.push(EIGHTHS[eighths % 8]);
-            rest -= 1;
+    /// A meter `cells` wide: a thin line filled to `frac`, each filled cell green, amber or red by where it sits,
+    /// so a fuller meter runs into the warning colours. Anything above nothing shows at least one cell.
+    fn meter(&mut self, frac: f64, cells: usize, levels: (f64, f64)) {
+        let frac = frac.clamp(0.0, 1.0);
+        let filled = if frac > 0.0 {
+            ((frac * cells as f64).round() as usize).clamp(1, cells)
+        } else {
+            0
+        };
+        for i in 0..cells {
+            let color = if i < filled {
+                level((i as f64 + 0.5) / cells as f64, levels)
+            } else {
+                TRACK
+            };
+            self.push(ink(color), "━");
         }
-        self.push(ink(color), &filled);
-        self.push(ink(TRACK), &"░".repeat(rest));
     }
 
     fn done(self) -> Spans {
@@ -851,7 +1134,8 @@ impl Frame {
         }
     }
 
-    /// Writes one character, keeping the cell's background. A wide character that doesn't fit is left out.
+    /// Writes one character, keeping the cell's background unless the ink brings its own. A wide character that
+    /// doesn't fit is left out.
     fn put(&mut self, x: usize, y: usize, c: char, ink: Ink) {
         let w = cell_width(c);
         if w == 0 || y >= self.h || x + w > self.w {
@@ -865,11 +1149,13 @@ impl Frame {
         if x + w < self.w && self.cells[at + w].0 == WIDE_HALF {
             self.cells[at + w].0 = ' ';
         }
-        self.cells[at].0 = c;
-        self.cells[at].1 = ink;
-        if w == 2 {
-            self.cells[at + 1].0 = WIDE_HALF;
-            self.cells[at + 1].1 = ink;
+        for i in 0..w {
+            let cell = &mut self.cells[at + i];
+            cell.0 = if i == 0 { c } else { WIDE_HALF };
+            cell.1 = ink;
+            if let Some(bg) = ink.bg {
+                cell.2 = bg;
+            }
         }
     }
 
@@ -920,9 +1206,9 @@ impl Frame {
             self.put(a.x + a.w - 1, y, '│', border);
         }
         let title = format!(" {title} ");
-        let title_w = width(&title);
+        let title_w = width_of(&title);
         self.spans(a.x + 2, a.y, a.w - 4, &[(bold(accent), title)]);
-        let status_w: usize = status.iter().map(|(_, s)| width(s)).sum();
+        let status_w: usize = status.iter().map(|(_, s)| width_of(s)).sum();
         if status_w > 0 && title_w + status_w + 7 <= a.w {
             let x = a.x + a.w - 3 - status_w - 1;
             self.put(x, a.y, ' ', border);
@@ -943,18 +1229,18 @@ impl Frame {
         let mut out = String::new();
         for y in 0..self.h {
             out += &format!("\x1b[{};1H", y + 1);
-            let mut last: Option<(Ink, Rgb)> = None;
+            let mut last: Option<(Rgb, bool, Rgb)> = None;
             for x in 0..self.w.saturating_sub(1) {
                 let (c, ink, bg) = self.cells[y * self.w + x];
                 if c == WIDE_HALF {
                     continue;
                 }
-                if last != Some((ink, bg)) {
+                if last != Some((ink.fg, ink.bold, bg)) {
                     let (r, g, b) = ink.fg;
                     let (br, bgr, bb) = bg;
                     let weight = if ink.bold { ";1" } else { "" };
                     out += &format!("\x1b[0;38;2;{r};{g};{b};48;2;{br};{bgr};{bb}{weight}m");
-                    last = Some((ink, bg));
+                    last = Some((ink.fg, ink.bold, bg));
                 }
                 out.push(c);
             }
@@ -990,8 +1276,8 @@ mod tests {
         spans.iter().map(|(_, s)| s.as_str()).collect()
     }
 
-    fn done(code: i32, waited: u64, command: &str) -> gate::Done {
-        gate::Done {
+    fn done(code: i32, waited: u64, command: &str) -> Done {
+        Done {
             ended: 1_000,
             class: "build".into(),
             place: "spaceport-stage7".into(),
@@ -1005,30 +1291,108 @@ mod tests {
 
     const LONG: &str = "python -I C:/Users/alexander/.claude/jobs/2233184a/tmp/shots.py C:/Users/alexander/.claude/jobs/2233184a/out";
 
+    /// The column a text starts at in a row, in characters.
+    fn at(row: &str, what: &str) -> usize {
+        row[..row.find(what).unwrap_or_else(|| panic!("{what} in {row}"))]
+            .chars()
+            .count()
+    }
+
     #[test]
-    fn recent_rows_put_the_command_last_under_their_heading_and_fit() {
+    fn recent_rows_sit_under_their_headings_and_fit() {
+        let runs = [done(101, 0, LONG), done(0, 0, LONG), done(0, 156, LONG)];
         for width in [76, 106, 206] {
-            let failed = shown(&recent_row(&done(101, 0, LONG), 1_032, width));
-            let fine = shown(&recent_row(&done(0, 0, LONG), 1_032, width));
-            let waited = shown(&recent_row(&done(0, 156, LONG), 1_032, width));
-            let heading = shown(&recent_heading(width));
-            for row in [&failed, &fine, &waited, &heading] {
-                assert!(super::width(row) <= width, "{width}: {row}");
+            let cols = RecentColumns::fit(&runs, width);
+            let heading = shown(&recent_heading(&cols, width));
+            let rows: Vec<String> = runs
+                .iter()
+                .map(|d| shown(&recent_row(d, 1_032, &cols, width)))
+                .collect();
+            for row in rows.iter().chain([&heading]) {
+                assert!(width_of(row) <= width, "{width}: {row}");
+                assert!(!row.contains("ago"), "{row}");
             }
-            // The command starts in the same column, whatever the note says, under its heading.
-            let at = |row: &str, what: &str| row[..row.find(what).unwrap()].chars().count();
-            assert_eq!(at(&failed, "python"), at(&fine, "python"));
-            assert_eq!(at(&failed, "python"), at(&waited, "python"));
-            assert_eq!(at(&failed, "python"), at(&heading, "COMMAND"));
-            assert_eq!(at(&failed, "exit 101"), at(&heading, "RESULT"));
-            assert_eq!(at(&failed, "spaceport"), at(&heading, "CHECKOUT"));
+            for row in &rows {
+                assert_eq!(at(row, "python"), at(&heading, "COMMAND"), "{row}");
+                assert_eq!(at(row, "spaceport"), at(&heading, "CHECKOUT"), "{row}");
+            }
+            assert_eq!(at(&rows[0], "exit 101"), at(&heading, "RESULT"));
+            assert_eq!(at(&rows[2], "waited 2m36s"), at(&heading, "RESULT"));
         }
-        let wide = shown(&recent_row(&done(0, 0, LONG), 1_032, 206));
-        assert!(wide.ends_with(LONG), "{wide}");
-        assert!(
-            wide.starts_with("32s ago ✓ build spaceport-stage7      1m08s  11.0 GB"),
-            "{wide}"
+        let wide = RecentColumns::fit(&runs, 206);
+        assert_eq!(
+            wide,
+            RecentColumns {
+                class: true,
+                peak: true,
+                place: 16,
+                note: 12
+            }
         );
+        let row = shown(&recent_row(&runs[1], 1_032, &wide, 206));
+        assert!(
+            row.starts_with(" 32s ✓ build spaceport-stage7  1m08s  11.0 GB  "),
+            "{row}"
+        );
+        assert!(row.ends_with(LONG), "{row}");
+        // Narrow: the class goes first, then the peak.
+        let narrow = RecentColumns::fit(&runs, 76);
+        assert!(!narrow.class && !narrow.peak, "{narrow:?}");
+        let middle = RecentColumns::fit(&runs, 100);
+        assert!(!middle.class && middle.peak, "{middle:?}");
+    }
+
+    #[test]
+    fn the_result_column_goes_when_no_run_has_one() {
+        let runs = [done(0, 0, "cargo build")];
+        let cols = RecentColumns::fit(&runs, 206);
+        assert_eq!(cols.note, 0);
+        assert!(!shown(&recent_heading(&cols, 206)).contains("RESULT"));
+    }
+
+    #[test]
+    fn the_summary_shows_failures_only_when_there_are_some() {
+        let text = |s: Spans| shown(&s);
+        assert_eq!(
+            text(summary(3, 0, 34 << 30, false, 0)),
+            " 3 running   0 waiting   34.0 GB free  "
+        );
+        let busy = summary(2, 1, 3 << 30, true, 2);
+        assert!(text(busy.clone()).contains(" 2 failed in 10 min "));
+        // Waiting and low memory are tinted; nothing waiting is a plain chip.
+        assert_eq!(busy[2].0.fg, AMBER);
+        assert_eq!(busy[4].0.fg, RED);
+        assert_eq!(summary(0, 0, 0, false, 0)[2].0, chip(None));
+    }
+
+    #[test]
+    fn meters_fill_from_green_into_the_warning_colours() {
+        let mut l = Line::new(10);
+        l.meter(0.95, 10, MEMORY_LEVELS);
+        let spans = l.done();
+        assert_eq!(
+            spans
+                .iter()
+                .map(|(i, s)| (i.fg, s.chars().count()))
+                .collect::<Vec<_>>(),
+            [(GREEN, 7), (AMBER, 2), (RED, 1)]
+        );
+        let mut l = Line::new(10);
+        l.meter(0.001, 10, MEMORY_LEVELS);
+        let spans = l.done();
+        assert_eq!((spans[0].0.fg, spans[0].1.chars().count()), (GREEN, 1));
+        assert_eq!((spans[1].0.fg, spans[1].1.chars().count()), (TRACK, 9));
+    }
+
+    #[test]
+    fn graphs_are_two_rows_tall_with_the_newest_on_the_right() {
+        let history: VecDeque<f64> = [0.0, 0.5, 1.0].into();
+        let [top, low] = graph(&history, 4, MEMORY_LEVELS);
+        assert_eq!(shown(&top), "   █");
+        assert_eq!(shown(&low), "▁▁██");
+        assert_eq!(low.last().unwrap().0.fg, RED);
+        assert_eq!(span(34), "34s");
+        assert_eq!(span(150), "2 min");
     }
 
     #[test]
@@ -1060,7 +1424,7 @@ mod tests {
             .collect();
             assert_eq!(rows.len(), 4);
             for row in &rows {
-                assert!(super::width(row) <= width, "{width}: {row}");
+                assert!(width_of(row) <= width, "{width}: {row}");
             }
             // The time stays next to the name, not at the far edge.
             assert!(
@@ -1076,23 +1440,38 @@ mod tests {
     }
 
     #[test]
-    fn waiting_rows_fit() {
-        let e = Entry {
-            since: gate::now() - 95,
+    fn free_slots_share_one_row() {
+        let holders = [None, Some(entry("x", 5)), None];
+        assert_eq!(shown(&free_row(&holders, 40).unwrap()), "○ 0  ○ 2  free");
+        assert!(free_row(&[Some(entry("x", 5))], 40).is_none());
+    }
+
+    fn entry(place: &str, age: u64) -> Entry {
+        Entry {
+            since: gate::now() - age,
             pid: 1,
-            place: "a-checkout-with-a-very-long-name".into(),
+            place: place.into(),
             command: LONG.into(),
             usage: None,
-        };
+        }
+    }
+
+    #[test]
+    fn waiting_rows_fit() {
+        let e = entry("a-checkout-with-a-very-long-name", 95);
         for width in [36, 76, 206] {
             let row = shown(&waiting_row(0, Class::Build, &e, width));
-            assert!(super::width(&row) <= width, "{width}: {row}");
+            assert!(width_of(&row) <= width, "{width}: {row}");
         }
         let row = shown(&waiting_row(0, Class::Build, &e, 206));
         assert!(
             row.starts_with(" 1 build a-checkout-with-a-…    1m35s  python"),
             "{row}"
         );
+        let [first, second] = queue_rows(0, Class::Build, &e, 34);
+        assert_eq!(shown(&first), " 1 build a-checkout-with-a-… 1m35s");
+        assert_eq!(width_of(&shown(&second)), 34);
+        assert!(shown(&second).starts_with("   python -I"));
     }
 
     #[test]
@@ -1102,12 +1481,12 @@ mod tests {
             (vec![(ink(TEXT), "first".to_string())], PANEL),
             (vec![(ink(TEXT), "x".repeat(60))], STRIPE),
         ];
-        let status = vec![(ink(MUTED), "2 of 2 in use".to_string())];
+        let status = vec![(ink(MUTED), "2/2 busy".to_string())];
         f.panel(Area::new(1, 1, 30, 4), "build", &status, ACCENT, &rows);
         assert_eq!(f.row(0), " ".repeat(40));
         assert_eq!(
             f.row(1),
-            format!(" ╭─ build ──── 2 of 2 in use ─╮{}", " ".repeat(9))
+            format!(" ╭─ build ───────── 2/2 busy ─╮{}", " ".repeat(9))
         );
         assert_eq!(
             f.row(2),
@@ -1125,6 +1504,15 @@ mod tests {
     }
 
     #[test]
+    fn chips_bring_their_own_background() {
+        let mut f = Frame::new(10, 1);
+        f.spans(0, 0, 10, &[(ink(TEXT), "a".into()), (KEYCAP, " k ".into())]);
+        assert_eq!(f.cells[0].2, BASE);
+        assert!(f.cells[1..4].iter().all(|c| c.2 == STRIPE));
+        assert_eq!(f.cells[4].2, BASE);
+    }
+
+    #[test]
     fn wide_characters_take_two_cells_and_never_split() {
         let mut f = Frame::new(6, 1);
         f.spans(0, 0, 6, &[(ink(TEXT), "a漢b".to_string())]);
@@ -1134,7 +1522,7 @@ mod tests {
         f.spans(0, 0, 3, &[(ink(TEXT), "ab漢".to_string())]);
         assert_eq!(f.row(0), "ab ");
         assert_eq!(clip("漢字漢字", 5), "漢字…");
-        assert_eq!(width("✓ ✗ ◆ › …"), 9);
+        assert_eq!(width_of("✓ ✗ ◆ › … ━"), 11);
     }
 
     #[test]
