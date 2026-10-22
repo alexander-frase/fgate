@@ -4,8 +4,9 @@
 //! fgate cargo test -p my_crate         a build slot: cargo build/check/test/clippy/run, test runs
 //! fgate --gpu <program> …              the GPU slot: games, renderers, screenshot scripts
 //! fgate status                         who holds the slots, who is waiting
-//! fgate watch                          the same, live, with memory, CPU and recent runs
-//! fgate hook [options]                 the agent hook: refuses ungated cargo, C++ (and GPU) commands
+//! fgate watch                          the same, live, with memory, CPU, each job's output and recent runs
+//! fgate peek [name]                    a job's output as it comes, or how a finished run ended
+//! fgate hook [options]                the agent hook: refuses ungated cargo, C++ (and GPU) commands
 //! ```
 //!
 //! A waiting command keeps its place in a fair line and prints where it stands. Once it has a slot, the
@@ -18,6 +19,7 @@
 mod config;
 mod gate;
 mod hook;
+mod output;
 mod switch;
 mod sys;
 mod watch;
@@ -35,7 +37,9 @@ const HELP: &str = "fgate: the build gate (https://github.com/alexander-frase/fg
                                ceiling (now_mem_gb); one that needs more belongs in the line
   fgate status                 show the slots and the line
   fgate watch                  a live view of the slots, the line and recent runs (Ctrl+C ends it)
-  fgate hook [options]         agent hook for Claude Code and Copilot (reads the tool call on stdin)
+  fgate peek [name]            follow a running job's output, or show how a finished run ended; name is the
+                               checkout's name as watch shows it (or `fgate peek <class> <slot>`)
+  fgate hook [options]        agent hook for Claude Code and Copilot (reads the tool call on stdin)
       --gpu a,b                  programs that must run under `fgate --gpu`
       --protect-branch <name>    refuse `git push` to this branch
       --protect-label <name>     refuse `gh` commands that name this label
@@ -44,7 +48,10 @@ const HELP: &str = "fgate: the build gate (https://github.com/alexander-frase/fg
 A compiling cargo command into a target directory other checkouts share (CARGO_TARGET_DIR) first cleans this
 workspace's own packages there when another checkout built that profile last (switch_clean). After it, the
 workspace's executables are copied into the checkout, target/fgate-bin/<profile>/, where no other checkout's
-build deletes them (keep_bins).
+build deletes them (keep_bins). After `cargo publish` or `cargo package`, the workspace's packages are cleaned, so
+the next build compiles the real sources, not the copy the verify step built.
+When fgate's output goes to a pipe or file (an agent's shell), the command's output is passed on unchanged and its
+last lines are kept for `fgate peek` and `fgate watch` (capture).
 Settings: config.txt in fgate's folder (`fgate status` shows where), or FGATE_* environment variables.";
 
 /// Set for everything fgate runs: a gated command that starts another `fgate …` already holds a slot.
@@ -72,6 +79,7 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Some("watch") => watch::run(),
+        Some("peek") => output::peek(&args[1..]),
         Some("hook") => hook::run(&args[1..]),
         Some("--gpu") => run(gate::Class::Gpu, &args[1..]),
         Some("--now") => run(gate::Class::Now, &args[1..]),
@@ -90,7 +98,7 @@ fn run(class: gate::Class, command: &[String]) -> ! {
         let shared = shared(&config, command);
         prepare(&config, shared.as_ref());
         let status = Command::new(program).args(args).status();
-        keep(&config, shared.as_ref(), &status);
+        after(&config, command, shared.as_ref(), &status);
         exit(status);
     }
 
@@ -121,6 +129,7 @@ fn run(class: gate::Class, command: &[String]) -> ! {
             }
         }
     }
+    let mut capture = output::Capture::prepare(&config, class, held.index, &mut child);
     eprintln!(
         "fgate: {} slot {} {}{}— {}",
         class.name(),
@@ -155,9 +164,15 @@ fn run(class: gate::Class, command: &[String]) -> ! {
         if let Some(job) = &job {
             job.started(&running);
         }
+        if let Some(capture) = &mut capture {
+            capture.start(&mut running);
+        }
         running.wait()
     });
     let ran = ran.elapsed();
+    if let Some(capture) = &mut capture {
+        capture.drain();
+    }
     let peak = job.as_deref().map(sys::Job::peak_memory).unwrap_or(0);
     let exit_code = status.as_ref().map_or(127, code);
     let hit = job.as_deref().is_some_and(|job| job.hit_ceiling(exit_code));
@@ -182,27 +197,26 @@ fn run(class: gate::Class, command: &[String]) -> ! {
     }
     eprintln!("{summary}");
     // Before the slot goes to the next build, which may clean these executables away.
-    keep(&config, shared.as_ref(), &status);
+    after(&config, command, shared.as_ref(), &status);
+    let done = gate::Done {
+        ended: gate::now(),
+        class: class.name().into(),
+        place: gate::here(),
+        command: line,
+        ran,
+        waited,
+        peak,
+        code: exit_code,
+    };
+    // Also before the slot is given back, so `fgate peek` finds the run once the slot is free.
+    if let Some(capture) = capture {
+        capture.finish(&done);
+    }
     // Gives the slot back (the reporter stops with it).
     if let Ok(mut held) = held.lock() {
         held.take();
     }
-    gate::record(
-        &config,
-        &gate::Done {
-            ended: gate::now(),
-            class: class.name().into(),
-            place: gate::here(),
-            command: line,
-            ran,
-            waited,
-            peak,
-            code: match &status {
-                Ok(s) => code(s),
-                Err(_) => 127,
-            },
-        },
-    );
+    gate::record(&config, &done);
     // Ends what the command left running. On Windows that happens when fgate exits with the job still open
     // (closing it first would end fgate too, and replace the command's exit code).
     if let Some(job) = &job {
@@ -227,16 +241,24 @@ fn prepare(config: &Config, shared: Option<&switch::Shared>) {
     }
 }
 
-/// Keeps the executables of a build that succeeded (keep_bins).
-fn keep(
+/// After a command that succeeded: keeps a build's executables (keep_bins), and cleans up after a publish's
+/// verify build.
+fn after(
     config: &Config,
+    command: &[String],
     shared: Option<&switch::Shared>,
     status: &std::io::Result<std::process::ExitStatus>,
 ) {
+    if !status.as_ref().is_ok_and(|s| s.success()) {
+        return;
+    }
     if let Some(s) = shared {
-        if config.keep_bins != 0 && status.as_ref().is_ok_and(|s| s.success()) {
+        if config.keep_bins != 0 {
             switch::keep(s);
         }
+    }
+    if let Some(build) = switch::publishes(command) {
+        switch::clean_after_publish(&build);
     }
 }
 
@@ -260,19 +282,40 @@ fn code(status: &std::process::ExitStatus) -> i32 {
     status.code().unwrap_or(1)
 }
 
-/// The command as the status shows it: the program without its folder, at most 140 characters.
+/// The command as the status shows it: the program without its folder, on one line, at most 400 characters.
 fn short(command: &[String]) -> String {
     let program = command[0].replace('\\', "/");
     let program = program.rsplit('/').next().unwrap_or(&program);
     let rest = command[1..].iter().map(String::as_str);
+    // One line: a multi-line argument (`python -c "…"`) would break the slot's file apart.
     let mut line = std::iter::once(program)
         .chain(rest)
+        .flat_map(str::split_whitespace)
         .collect::<Vec<_>>()
         .join(" ");
-    if line.chars().count() > 140 {
-        line = line.chars().take(139).collect::<String>() + "…";
+    if line.chars().count() > 400 {
+        line = line.chars().take(399).collect::<String>() + "…";
     }
     line
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn the_command_is_shown_on_one_line() {
+        let command: Vec<String> = [
+            "C:\\Python\\python.exe",
+            "-c",
+            "import time\nfor i in range(3):\n    print(i)",
+        ]
+        .map(String::from)
+        .into();
+        assert_eq!(
+            super::short(&command),
+            "python.exe -c import time for i in range(3): print(i)"
+        );
+        assert_eq!(super::short(&["x".repeat(500)]).chars().count(), 400);
+    }
 }
 
 #[cfg(not(any(windows, unix)))]

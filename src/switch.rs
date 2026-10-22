@@ -60,6 +60,12 @@ impl Build {
 
 /// The build a command asks for, if it is a compiling cargo command (`cargo +nightly test …`, `cargo.exe b`).
 pub fn parse(command: &[String]) -> Option<Build> {
+    let (sub, build) = parse_any(command)?;
+    COMPILING.contains(&sub.as_str()).then_some(build)
+}
+
+/// What a cargo command line says, with its subcommand, whatever the subcommand.
+fn parse_any(command: &[String]) -> Option<(String, Build)> {
     let program = command.first()?;
     let name = Path::new(program)
         .file_stem()?
@@ -107,9 +113,6 @@ pub fn parse(command: &[String]) -> Option<Build> {
         i += 1;
     }
     let sub = sub?;
-    if !COMPILING.contains(&sub.as_str()) {
-        return None;
-    }
     let default = if sub == "bench" { "bench" } else { "dev" };
     let profile = profile.unwrap_or_else(|| default.into());
     let dir = match profile.as_str() {
@@ -129,14 +132,60 @@ pub fn parse(command: &[String]) -> Option<Build> {
         Some(t) => format!("{t}/{dir}"),
         None => dir.to_string(),
     };
-    Some(Build {
+    let build = Build {
         cargo: program.clone(),
         toolchain: command.get(1).filter(|a| a.starts_with('+')).cloned(),
         target_dir,
         manifest,
         flags,
         key,
-    })
+    };
+    Some((sub, build))
+}
+
+/// The packaging a command does, if it is a `cargo publish` or `cargo package` that verifies the package by
+/// building it.
+pub fn publishes(command: &[String]) -> Option<Build> {
+    let (sub, build) = parse_any(command)?;
+    let skips = command
+        .iter()
+        .take_while(|a| a.as_str() != "--")
+        .any(|a| a == "--no-verify" || a == "--list" || a == "-l");
+    (["publish", "package"].contains(&sub.as_str()) && !skips).then_some(build)
+}
+
+/// After a `cargo publish` or `cargo package` that succeeded: its verify step built the packaged copy in
+/// `target/package/<name>-<version>/` under the same names as the workspace's own build, and cargo's records then
+/// point at the copy's sources, so a later `cargo build` takes the published version for fresh and stops rebuilding.
+/// Cleaning the workspace's packages (their dev builds) makes the next build start from the real sources.
+pub fn clean_after_publish(build: &Build) {
+    let Some(members) = metadata(build).map(|m| package_names(&m)) else {
+        return;
+    };
+    if members.is_empty() {
+        return;
+    }
+    let mut clean = build.cargo();
+    clean.arg("clean").arg("--quiet");
+    for m in &members {
+        clean.args(["-p", m]);
+    }
+    clean.args(&build.flags);
+    if let Some(d) = &build.target_dir {
+        clean.arg("--target-dir").arg(d);
+    }
+    if let Some(m) = &build.manifest {
+        clean.arg("--manifest-path").arg(m);
+    }
+    match clean.status() {
+        Ok(s) if s.success() => eprintln!(
+            "fgate: cleaned this workspace's {} package(s) after the verify build, so the next cargo build \
+             compiles from the real sources, not the packaged copy",
+            members.len()
+        ),
+        Ok(s) => eprintln!("fgate: cargo clean after the verify build failed ({s})"),
+        Err(e) => eprintln!("fgate: could not run cargo clean after the verify build ({e})"),
+    }
 }
 
 /// A compiling cargo command into a target directory that other checkouts may share.
@@ -446,6 +495,29 @@ mod tests {
         ] {
             assert!(parse(&cmd(c)).is_none(), "{c}");
         }
+    }
+
+    #[test]
+    fn finds_publishing_that_builds_the_package() {
+        for c in [
+            "cargo publish",
+            "cargo +stable publish --dry-run",
+            "cargo package --allow-dirty",
+            "cargo.exe publish -p fgate --manifest-path x/Cargo.toml",
+        ] {
+            assert!(publishes(&cmd(c)).is_some(), "{c}");
+        }
+        for c in [
+            "cargo publish --no-verify",
+            "cargo package --list",
+            "cargo build",
+            "cargo run -- publish",
+            "cargo login",
+        ] {
+            assert!(publishes(&cmd(c)).is_none(), "{c}");
+        }
+        let b = publishes(&cmd("cargo publish --target x86_64-pc-windows-msvc")).unwrap();
+        assert_eq!(b.flags, cmd("--target x86_64-pc-windows-msvc"));
     }
 
     #[test]

@@ -15,7 +15,8 @@ fgate cargo test -p my_crate        waits for a build slot, then runs the comman
 fgate --gpu my_game.exe --shots     waits for the GPU slot (games, renderers, screenshot scripts)
 fgate --now cargo publish           skips the line: small commands, within a small memory ceiling
 fgate status                        who holds the slots, who is waiting
-fgate watch                         the same, live: memory, CPU, each job's usage, recent runs
+fgate watch                         the same, live: memory, CPU, each job's usage and output, recent runs
+fgate peek [name]                   a running job's output as it comes, or how a finished run ended
 fgate hook [options]                an agent hook (Claude Code, Copilot) that refuses cargo and C++ builds without fgate
 ```
 
@@ -64,6 +65,31 @@ The command's own output and exit code pass through untouched. A gated command t
 Agents name their place by their folder, or by their worktree for checkouts under `.claude/worktrees/<name>`,
 so the status shows `spaceport-sp1: cargo build` rather than a process id.
 
+### Seeing what a job is doing: `fgate peek`
+
+An agent's command writes its output into the agent's shell, where nobody else sees it. When fgate's own output goes
+to a pipe or a file like that, fgate passes the command's output on unchanged and keeps its last 200 lines in its
+folder. `fgate watch` shows each running job's newest line under it, and `fgate peek` follows one:
+
+```text
+$ fgate peek geothermal
+── geothermal · build slot 0 · cargo test --workspace -j 4 · running 1m02s
+   Compiling terrain v0.3.0 (E:\code\game\.claude\worktrees\geothermal\crates\terrain)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 58.40s
+     Running unittests src\lib.rs (target\debug\deps\terrain-6c0f3d5e8a1b2c47.exe)
+test erosion::keeps_rivers ... FAILED
+...
+── ended after 1m08s · exit 101
+```
+
+The name is the checkout's name, as `watch` shows it; `fgate peek gpu 1` picks a slot, and `fgate peek` alone the only
+running job. After a run ends, its last 40 lines stay with the last 50 runs, so `fgate peek geothermal` still shows how
+it ended.
+
+Output that goes to a terminal is left alone, with its colours and progress bars: whoever sits there sees it already.
+Lines come from both streams in the order they came, without colour codes. A Python script's output shows as it is
+printed, because fgate sets `PYTHONUNBUFFERED=1` unless the command sets its own. `capture = 0` turns it off.
+
 ## Checkouts sharing one target directory
 
 Agents often work in git worktrees, one checkout each, and build into one shared `CARGO_TARGET_DIR` so the
@@ -99,6 +125,19 @@ from there, the shared target's copy goes with the next checkout's build (keep_b
 It copies only when the record says this checkout built that profile last, so a kept executable is always the
 checkout's own code, and only what changed since the last copy. A kept executable that is running is renamed out of
 the way, which Windows allows, rather than overwritten. `keep_bins = 0` turns it off.
+
+## After `cargo publish`
+
+`cargo publish` and `cargo package` check the package by building a copy of it in `target/package/<name>-<version>/`,
+into the same target directory and under the same names as the workspace's own build. Afterwards cargo's records point
+at the copy's sources, which never change, so a later `cargo build` takes the published version for fresh and stops
+rebuilding the binary, however the real sources change. So after a gated publish or package that succeeds (and
+verified), fgate cleans the workspace's own packages, and the next build compiles the real sources:
+
+```text
+fgate: cleaned this workspace's 1 package(s) after the verify build, so the next cargo build compiles from the real
+sources, not the packaged copy
+```
 
 ## How it works
 
@@ -151,6 +190,7 @@ waiting command reads it again when it changes. `fgate status` shows where the f
 | `night_min_free_gb` | 8                   | at night any command waits while less than this is free                 |
 | `switch_clean`      | 1                   | clean a shared target's workspace crates when another checkout built them (0 = off) |
 | `keep_bins`         | 1                   | copy a shared build's executables into the checkout's `target/fgate-bin/` (0 = off) |
+| `capture`           | 1                   | keep a job's last output lines for `peek` and `watch`, unless it goes to a terminal (0 = off) |
 
 Any setting can be overridden for one command with an environment variable such as `FGATE_MEM_GB=16`.
 `FGATE_DIR` points fgate at another folder, for trying it out without touching the real line.

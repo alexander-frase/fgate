@@ -35,9 +35,12 @@ pub struct Config {
     /// After a build into a shared target directory, copy the workspace's executables into the checkout's
     /// `target/fgate-bin/<profile>/` (`switch`; 0: off).
     pub keep_bins: u32,
+    /// Keep the last lines of a gated command's output for `fgate peek` and `fgate watch`, when that output goes
+    /// to a pipe or file rather than a terminal (`output`; 0: off).
+    pub capture: u32,
 }
 
-const KEYS: [&str; 15] = [
+const KEYS: [&str; 16] = [
     "build_slots",
     "gpu_slots",
     "now_slots",
@@ -53,6 +56,7 @@ const KEYS: [&str; 15] = [
     "night_min_free_gb",
     "switch_clean",
     "keep_bins",
+    "capture",
 ];
 
 impl Config {
@@ -79,6 +83,7 @@ impl Config {
             night: false,
             switch_clean: 1,
             keep_bins: 1,
+            capture: 1,
         };
         let file = c.file();
         match std::fs::read_to_string(&file) {
@@ -101,6 +106,9 @@ impl Config {
                 }
                 if !text.contains("keep_bins") {
                     more += &c.keep_text();
+                }
+                if !text.contains("capture") {
+                    more += &c.capture_text();
                 }
                 if !more.is_empty() {
                     let gap = if text.ends_with('\n') { "" } else { "\n" };
@@ -161,6 +169,7 @@ impl Config {
             "night_min_free_gb" => self.night_min_free_gb = n,
             "switch_clean" => self.switch_clean = n.min(1),
             "keep_bins" => self.keep_bins = n.min(1),
+            "capture" => self.capture = n.min(1),
             // A setting from a newer fgate, or a typo.
             _ => warn(&format!("unknown setting {key}")),
         }
@@ -212,6 +221,15 @@ impl Config {
         )
     }
 
+    fn capture_text(&self) -> String {
+        format!(
+            "# Keep the last lines of each gated command's output, for `fgate peek` and `fgate watch`, when it goes to\n\
+             # a pipe or file (an agent's shell) rather than a terminal (1 = on, 0 = off):\n\
+             capture = {}\n",
+            self.capture
+        )
+    }
+
     fn write_default(&self, file: &Path) {
         let text = format!(
             "# fgate settings for this machine (https://github.com/alexander-frase/fgate). Every agent reads this file,\n\
@@ -227,7 +245,7 @@ impl Config {
              # Each gated command's memory ceiling in GB, everything it starts together (0 = none):\n\
              mem_gb = {}\n\
              # A second command waits while less than this many GB are free:\n\
-             min_free_gb = {}\n{}{}{}{}",
+             min_free_gb = {}\n{}{}{}{}{}",
             self.build_slots,
             self.gpu_slots,
             self.jobs,
@@ -237,7 +255,8 @@ impl Config {
             self.night_text(),
             self.now_text(),
             self.switch_text(),
-            self.keep_text()
+            self.keep_text(),
+            self.capture_text()
         );
         let _ = std::fs::create_dir_all(&self.dir);
         let _ = std::fs::write(file, text);
