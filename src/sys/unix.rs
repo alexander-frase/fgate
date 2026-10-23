@@ -548,6 +548,11 @@ pub fn quiet_broken_pipe() {
     unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
 }
 
+/// The program to start for `name`: the system finds it on the PATH as a shell does.
+pub fn program(name: &str) -> PathBuf {
+    PathBuf::from(name)
+}
+
 /// Linux keeps state under $XDG_STATE_HOME (~/.local/state); macOS under ~/Library/Application Support.
 pub(super) fn default_dir() -> PathBuf {
     let home = std::env::var_os("HOME").map(PathBuf::from);
