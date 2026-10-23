@@ -312,7 +312,10 @@ impl Capture {
             Ok(t) => t.text(RUN_LINES),
             Err(_) => return,
         };
-        let name = format!("{:012}-{}.txt", done.ended, std::process::id());
+        let ended_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis());
+        let name = run_name(ended_ms, std::process::id());
         replace(&self.runs.join(name), &format!("{}\n{text}", done.line()));
         let _ = fs::remove_file(&self.path);
         prune(&self.runs);
@@ -345,6 +348,14 @@ where
             }
         }
     })
+}
+
+/// A kept run's file name: when it ended, in milliseconds, then fgate's process id. Names sort oldest first; with
+/// whole seconds, two runs ending in the same second sorted by process id, which Windows hands out in no order, so
+/// `peek` could show the run before (the Windows smoke test's failure since 0.5.0). Older names in seconds, padded to
+/// 12 digits, still sort among these by their leading digits.
+fn run_name(ended_ms: u128, pid: u32) -> String {
+    format!("{ended_ms:015}-{pid}.txt")
 }
 
 /// Keeps the newest `RUNS_KEPT` runs.
@@ -737,6 +748,35 @@ mod tests {
         assert_eq!(all[0].kept.lines, [format!("run {}", RUNS_KEPT + 4)]);
         let even = all.iter().find(|r| r.done.place == "even").unwrap();
         assert_eq!(ending(&even.done), "ended after 3s · exit 101");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_newest_run_comes_first_within_one_second() {
+        let dir = std::env::temp_dir().join(format!("fgate-same-second-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        // The older run had the larger process id, as Windows may hand out.
+        for (ms, pid, command) in [
+            (1_792_729_189_100u128, 9000, "older"),
+            (1_792_729_189_700, 12, "newer"),
+        ] {
+            let done = Done {
+                ended: (ms / 1000) as u64,
+                class: "build".into(),
+                place: "fgate".into(),
+                command: command.into(),
+                ran: Duration::ZERO,
+                waited: Duration::ZERO,
+                peak: 0,
+                code: 0,
+            };
+            replace(
+                &dir.join(run_name(ms, pid)),
+                &format!("{}\n{}", done.line(), Tail::default().text(RUN_LINES)),
+            );
+        }
+        assert_eq!(runs_in(&dir)[0].done.command, "newer");
         let _ = fs::remove_dir_all(&dir);
     }
 }
