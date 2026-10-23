@@ -118,7 +118,7 @@ fn run(class: gate::Class, command: &[String]) -> ! {
         let shared = shared(&config, command);
         let lock = shared.as_ref().and_then(switch::lock);
         prepare(&config, shared.as_ref());
-        let mut child = Command::new(program);
+        let mut child = Command::new(sys::program(program));
         child.args(args);
         if let Some(lock) = &lock {
             child.env(switch::LOCK_VAR, &lock.target);

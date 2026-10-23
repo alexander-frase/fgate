@@ -60,7 +60,7 @@ impl Job {
         cpu_percent: u32,
         mem_bytes: u64,
     ) -> (Command, Option<Job>, Option<String>) {
-        let mut command = Command::new(program);
+        let mut command = Command::new(self::program(program));
         command.args(args);
         match Job::contain(cpu_percent, mem_bytes) {
             Ok(job) => (command, Some(job), None),
@@ -256,6 +256,51 @@ pub fn ceilings() -> Option<String> {
 /// Windows has no broken-pipe signal; nothing to do.
 pub fn quiet_broken_pipe() {}
 
+/// The program to start for `name`, found as a shell finds it. Rust looks only for `name` and `name.exe`, so
+/// `npm`, `npx`, `ng` and `tauri`, which are `.cmd` files here, would not be found. So a bare name is looked up in
+/// each PATH folder with the extensions PATHEXT lists, as PowerShell does; Rust starts a `.cmd` or `.bat` through
+/// cmd.exe. A name with a folder, or one not found, is left as it is.
+pub fn program(name: &str) -> PathBuf {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let pathext = std::env::var("PATHEXT").unwrap_or_default();
+    find(name, &path, &pathext).unwrap_or_else(|| PathBuf::from(name))
+}
+
+/// The extensions a process can be started from directly (a `.vbs` or `.ps1` on PATHEXT cannot).
+const STARTABLE: [&str; 4] = ["com", "exe", "bat", "cmd"];
+
+fn find(name: &str, path: &std::ffi::OsStr, pathext: &str) -> Option<PathBuf> {
+    if name.is_empty() || name.contains(['/', '\\', ':']) {
+        return None;
+    }
+    let startable = |ext: &str| STARTABLE.iter().any(|s| s.eq_ignore_ascii_case(ext));
+    let given = std::path::Path::new(name)
+        .extension()
+        .is_some_and(|e| startable(&e.to_string_lossy()));
+    let mut exts: Vec<String> = pathext
+        .split(';')
+        .filter_map(|e| e.strip_prefix('.'))
+        .filter(|e| startable(e))
+        .map(str::to_lowercase)
+        .collect();
+    if exts.is_empty() {
+        exts = STARTABLE.map(String::from).into();
+    }
+    // Folder by folder, as the shell does: the first folder with any match wins. An empty entry (`;;`, or the
+    // trailing `;` many PATHs have) would mean the current folder, which neither PowerShell nor Rust searches.
+    std::env::split_paths(path)
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .find_map(|dir| {
+            if given {
+                Some(dir.join(name)).filter(|p| p.is_file())
+            } else {
+                exts.iter()
+                    .map(|ext| dir.join(format!("{name}.{ext}")))
+                    .find(|p| p.is_file())
+            }
+        })
+}
+
 /// Windows keeps per-user program data under %LOCALAPPDATA%.
 pub(super) fn default_dir() -> PathBuf {
     std::env::var_os("LOCALAPPDATA")
@@ -324,4 +369,69 @@ pub fn console_size() -> (usize, usize) {
 
 fn last_error(what: &str) -> String {
     format!("{what}: {}", std::io::Error::last_os_error())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("fgate-win-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_bare_name_is_found_with_the_extensions_a_shell_tries() {
+        let root = temp("find");
+        let (first, second) = (root.join("first"), root.join("second"));
+        for d in [&first, &second] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        for file in [
+            first.join("tool.cmd"),
+            first.join("script.ps1"),
+            second.join("tool.exe"),
+            second.join("other.bat"),
+        ] {
+            std::fs::write(file, "").unwrap();
+        }
+        let path = std::env::join_paths([&root.join("missing"), &first, &second]).unwrap();
+        let pathext = ".COM;.EXE;.BAT;.CMD;.VBS;.PS1";
+        // The first folder with a match wins, whatever the extension.
+        assert_eq!(find("tool", &path, pathext), Some(first.join("tool.cmd")));
+        assert_eq!(
+            find("other", &path, pathext),
+            Some(second.join("other.bat"))
+        );
+        assert_eq!(
+            find("tool.exe", &path, pathext),
+            Some(second.join("tool.exe"))
+        );
+        // Without PATHEXT, the extensions a process can be started from.
+        assert_eq!(find("tool", &path, ""), Some(first.join("tool.cmd")));
+        // Not something a process can be started from, not there, or with a folder: left to Rust.
+        assert_eq!(find("script", &path, pathext), None);
+        assert_eq!(find("missing", &path, pathext), None);
+        let named = first.join("tool.cmd").to_string_lossy().into_owned();
+        assert_eq!(find(&named, &path, pathext), None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_cmd_file_runs_with_its_arguments_and_exit_code() {
+        let root = temp("cmd");
+        std::fs::write(root.join("say.cmd"), "@echo %~1 %~2\r\n@exit /b 3\r\n").unwrap();
+        let program = find("say", root.as_os_str(), ".EXE;.CMD").unwrap();
+        let args = ["hello there".to_string(), "world".to_string()];
+        // Not through Job::prepare: that puts this test process in the job, which ends it when the job closes.
+        let output = Command::new(program).args(&args).output().unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            "hello there world"
+        );
+        assert_eq!(output.status.code(), Some(3));
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
