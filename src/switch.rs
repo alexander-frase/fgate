@@ -17,6 +17,12 @@
 //! checkout itself (`<checkout>/target/fgate-bin/<profile>/`), where no other checkout's build touches them
 //! (`keep_bins`; 0: off). It copies only when the record says this checkout built the profile last, so a kept
 //! executable is always this checkout's own code.
+//!
+//! The clean, the build and the keep belong together: with two build slots, another checkout's clean could run
+//! between this build and its keep (deleting what it built), or between its own clean and build, so that the record
+//! names one checkout while the crates are another's. So a build into a shared target holds that target's lock
+//! (`.fgate-lock` in it) from before its clean until after its keep. Cargo lets only one build use a target directory
+//! at a time anyway, so this costs no parallel building; only the waiting is fgate's instead of cargo's.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -24,6 +30,53 @@ use std::time::SystemTime;
 
 /// The record in the target directory: one line per profile, `<profile key>\t<workspace root>`.
 const STAMP: &str = ".fgate-checkouts";
+
+/// The lock a build holds on a shared target directory from its clean to its keep.
+const LOCK: &str = ".fgate-lock";
+
+/// Set on a command that holds a shared target's lock: the target, so a nested `fgate cargo …` in it doesn't wait for
+/// its own parent.
+pub const LOCK_VAR: &str = "FGATE_TARGET_LOCK";
+
+/// A held lock on a shared target directory; dropping it (or the process ending) gives it back.
+pub struct TargetLock {
+    _file: std::fs::File,
+    pub target: PathBuf,
+}
+
+/// Takes the shared target's lock, waiting while another build holds it. None when this command's parent already
+/// holds it, or the lock file can't be made (the build then goes ahead without it).
+pub fn lock(shared: &Shared) -> Option<TargetLock> {
+    let target = &shared.target;
+    if std::env::var_os(LOCK_VAR).is_some_and(|held| same(&held.to_string_lossy(), target)) {
+        return None;
+    }
+    std::fs::create_dir_all(target).ok()?;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(target.join(LOCK))
+        .ok()?;
+    let started = std::time::Instant::now();
+    let mut said = false;
+    while !crate::sys::try_lock(&file) {
+        if !said && started.elapsed() > std::time::Duration::from_secs(1) {
+            eprintln!(
+                "fgate: waiting for another build into {} to finish (a build's clean, build and kept executables go \
+                 together)",
+                target.display()
+            );
+            said = true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    Some(TargetLock {
+        _file: file,
+        target: target.clone(),
+    })
+}
 
 /// Cargo's subcommands (and their aliases) that compile the workspace.
 const COMPILING: [&str; 14] = [
@@ -64,14 +117,19 @@ pub fn parse(command: &[String]) -> Option<Build> {
     COMPILING.contains(&sub.as_str()).then_some(build)
 }
 
+/// Whether the command's program is cargo (`cargo`, `cargo.exe`, a path to it).
+pub fn is_cargo(command: &[String]) -> bool {
+    command.first().is_some_and(|program| {
+        Path::new(program)
+            .file_stem()
+            .is_some_and(|s| s.to_string_lossy().to_lowercase() == "cargo")
+    })
+}
+
 /// What a cargo command line says, with its subcommand, whatever the subcommand.
 fn parse_any(command: &[String]) -> Option<(String, Build)> {
     let program = command.first()?;
-    let name = Path::new(program)
-        .file_stem()?
-        .to_string_lossy()
-        .to_lowercase();
-    if name != "cargo" {
+    if !is_cargo(command) {
         return None;
     }
     // Everything after `--` belongs to the program cargo runs.
@@ -326,7 +384,7 @@ fn kept_dir(root: &Path, key: &str) -> PathBuf {
 /// Copies `from` to `to` unless `to` already has its size and modification time. Says whether it copied. The copy
 /// takes `from`'s modification time, and replaces `to` by renaming it away first, which Windows allows even while
 /// `to` is running.
-fn copy_if_changed(from: &Path, to: &Path) -> std::io::Result<bool> {
+pub fn copy_if_changed(from: &Path, to: &Path) -> std::io::Result<bool> {
     let meta = std::fs::metadata(from)?;
     let modified: SystemTime = meta.modified()?;
     if let Ok(old) = std::fs::metadata(to) {
@@ -582,6 +640,29 @@ mod tests {
             kept_dir(root, "x86_64-pc-windows-msvc/debug"),
             Path::new("/w/game/target/fgate-bin/x86_64-pc-windows-msvc/debug")
         );
+    }
+
+    #[test]
+    fn a_build_holds_the_shared_target_until_it_is_done() {
+        let dir = std::env::temp_dir().join(format!("fgate-lock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let shared = Shared {
+            build: parse(&cmd("cargo build")).unwrap(),
+            target: dir.clone(),
+            root: dir.clone(),
+        };
+        let held = lock(&shared).unwrap();
+        let other = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(dir.join(LOCK))
+            .unwrap();
+        assert!(!crate::sys::try_lock(&other), "another build waits");
+        drop(held);
+        assert!(crate::sys::try_lock(&other), "and goes once it is done");
+        crate::sys::unlock(&other);
+        drop(other);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
