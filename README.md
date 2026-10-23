@@ -60,7 +60,8 @@ runs a small command at once, without waiting in line, but it can't be used to s
 - At most `now_slots` (4) run at once. `status` and `watch` list them under `now` while they run.
 
 The command's own output and exit code pass through untouched. A gated command that itself runs `fgate …`
-(a script calling cargo, say) doesn't queue a second time: it already holds the slot.
+(a script calling cargo, say) doesn't queue a second time: it already holds the slot. `fgate --version` prints the
+version, and an option fgate doesn't know is refused at once rather than run as a program.
 
 Agents name their place by their folder, or by their worktree for checkouts under `.claude/worktrees/<name>`,
 so the status shows `spaceport-sp1: cargo build` rather than a process id.
@@ -125,6 +126,26 @@ from there, the shared target's copy goes with the next checkout's build (keep_b
 It copies only when the record says this checkout built that profile last, so a kept executable is always the
 checkout's own code, and only what changed since the last copy. A kept executable that is running is renamed out of
 the way, which Windows allows, rather than overwritten. `keep_bins = 0` turns it off.
+
+The clean, the build and the keep go together: with two build slots, another checkout's clean could otherwise run
+between this build and its keep, or between its own clean and build. So a build into a shared target holds the
+target's lock (`.fgate-lock` in it) from its clean until its keep. Cargo lets only one build use a target directory at
+a time anyway, so no parallel building is lost; the second build waits in fgate instead of in cargo:
+
+```text
+fgate: waiting for another build into E:\code\game\target to finish (a build's clean, build and kept executables go
+together)
+```
+
+### Cargo inside a script
+
+A script that builds (`fgate sh build.sh`, `fgate python shots.py`) is gated as a whole, but fgate sees only the
+script, not the `cargo build` in it. So a gated command that is not cargo itself gets fgate's own `cargo` first on its
+PATH: a copy of fgate, `shim/cargo` in fgate's folder. When the script runs `cargo …`, the copy finds the real cargo
+further along the PATH and runs it as a nested gated command: no second wait, since the script holds the slot, but the
+same clean, record and kept executables as `fgate cargo …`, even when the script sets `CARGO_TARGET_DIR` itself.
+Without it, the script's build left the record unchanged, and the next checkout's build took the script's crates for
+its own. A script that calls cargo by its full path, or clears the PATH, goes around it.
 
 ## After `cargo publish`
 

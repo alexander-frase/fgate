@@ -20,6 +20,7 @@ mod config;
 mod gate;
 mod hook;
 mod output;
+mod shim;
 mod switch;
 mod sys;
 mod watch;
@@ -35,6 +36,7 @@ const HELP: &str = "fgate: the build gate (https://github.com/alexander-frase/fg
   fgate --gpu <command> […]    run a GPU program (game, renderer, screenshot script) in the GPU slot
   fgate --now <command> […]    run a small command at once, skipping the line, within a small memory
                                ceiling (now_mem_gb); one that needs more belongs in the line
+  fgate --version              print fgate's version
   fgate status                 show the slots and the line
   fgate watch                  a live view of the slots, the line and recent runs (Ctrl+C ends it)
   fgate peek [name]            follow a running job's output, or show how a finished run ended; name is the
@@ -48,8 +50,10 @@ const HELP: &str = "fgate: the build gate (https://github.com/alexander-frase/fg
 A compiling cargo command into a target directory other checkouts share (CARGO_TARGET_DIR) first cleans this
 workspace's own packages there when another checkout built that profile last (switch_clean). After it, the
 workspace's executables are copied into the checkout, target/fgate-bin/<profile>/, where no other checkout's
-build deletes them (keep_bins). After `cargo publish` or `cargo package`, the workspace's packages are cleaned, so
-the next build compiles the real sources, not the copy the verify step built.
+build deletes them (keep_bins). The clean, the build and the keep hold the target's lock, so another checkout's build
+can't come in between. A gated command that is not cargo (a script) gets fgate's `cargo` first on its PATH, so the
+cargo it runs gets the same clean and keep. After `cargo publish` or `cargo package`, the workspace's packages are
+cleaned, so the next build compiles the real sources, not the copy the verify step built.
 When fgate's output goes to a pipe or file (an agent's shell), the command's output is passed on unchanged and its
 last lines are kept for `fgate peek` and `fgate watch` (capture).
 Settings: config.txt in fgate's folder (`fgate status` shows where), or FGATE_* environment variables.";
@@ -63,9 +67,16 @@ fn main() -> ExitCode {
     if args.first().map(String::as_str) == Some(sys::IN_SCOPE) {
         sys::in_scope(&args[1..]);
     }
+    // fgate's copy named cargo, run by a script inside a gated command: the real cargo, with fgate's checks.
+    if let Some(cargo) = shim::invoked_as_cargo() {
+        let command: Vec<String> = std::iter::once(cargo.to_string_lossy().into_owned())
+            .chain(args)
+            .collect();
+        run(gate::Class::Build, &command);
+    }
     if matches!(
         args.first().map(String::as_str),
-        None | Some("-h" | "--help" | "help" | "status")
+        None | Some("-h" | "--help" | "help" | "-V" | "--version" | "version" | "status")
     ) {
         sys::quiet_broken_pipe();
     }
@@ -73,6 +84,15 @@ fn main() -> ExitCode {
         None | Some("-h" | "--help" | "help") => {
             println!("{HELP}");
             ExitCode::SUCCESS
+        }
+        Some("-V" | "--version" | "version") => {
+            println!("fgate {}", env!("CARGO_PKG_VERSION"));
+            ExitCode::SUCCESS
+        }
+        // An option fgate doesn't know is a mistake, not a program to wait in line for.
+        Some(option) if option.starts_with('-') && option != "--gpu" && option != "--now" => {
+            eprintln!("fgate: unknown option {option}\n{HELP}");
+            ExitCode::from(2)
         }
         Some("status") => {
             gate::print_status(&Config::load());
@@ -96,9 +116,16 @@ fn run(class: gate::Class, command: &[String]) -> ! {
     if std::env::var_os(HELD_VAR).is_some() {
         let config = Config::load();
         let shared = shared(&config, command);
+        let lock = shared.as_ref().and_then(switch::lock);
         prepare(&config, shared.as_ref());
-        let status = Command::new(program).args(args).status();
+        let mut child = Command::new(program);
+        child.args(args);
+        if let Some(lock) = &lock {
+            child.env(switch::LOCK_VAR, &lock.target);
+        }
+        let status = child.status();
         after(&config, command, shared.as_ref(), &status);
+        drop(lock);
         exit(status);
     }
 
@@ -110,7 +137,9 @@ fn run(class: gate::Class, command: &[String]) -> ! {
     // The settings as they are now: they may have changed while the command waited.
     let config = Config::load();
     // A target directory shared with other checkouts: their builds of this workspace's crates must not be reused.
+    // Its lock is held from the clean to the keep, so another checkout's build can't come in between.
     let shared = shared(&config, command);
+    let lock = shared.as_ref().and_then(switch::lock);
     prepare(&config, shared.as_ref());
 
     let mem_gb = config.mem_gb_for(class);
@@ -121,6 +150,18 @@ fn run(class: gate::Class, command: &[String]) -> ! {
     }
     let job = job.map(Arc::new);
     child.env(HELD_VAR, class.name());
+    if let Some(lock) = &lock {
+        child.env(switch::LOCK_VAR, &lock.target);
+    }
+    // A command that is not cargo (a script) may run cargo itself: its cargo comes through fgate's shim.
+    if !switch::is_cargo(command) && (config.switch_clean != 0 || config.keep_bins != 0) {
+        if let Some(path) = shim::install(&shim::dir_in(&config.dir)).and_then(|dir| {
+            child.env(shim::DIR_VAR, &dir);
+            shim::path_with(&dir)
+        }) {
+            child.env("PATH", path);
+        }
+    }
     if class != gate::Class::Gpu {
         // cargo's and CMake's compiler jobs, unless the command sets its own.
         for var in ["CARGO_BUILD_JOBS", "CMAKE_BUILD_PARALLEL_LEVEL"] {
@@ -198,6 +239,7 @@ fn run(class: gate::Class, command: &[String]) -> ! {
     eprintln!("{summary}");
     // Before the slot goes to the next build, which may clean these executables away.
     after(&config, command, shared.as_ref(), &status);
+    drop(lock);
     let done = gate::Done {
         ended: gate::now(),
         class: class.name().into(),
