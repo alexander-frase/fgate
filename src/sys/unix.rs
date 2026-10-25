@@ -29,12 +29,13 @@ pub struct Job {
 
 impl Job {
     /// The command to run and the job it runs in (never a note: `status` and `watch` say when there are no
-    /// ceilings here).
+    /// ceilings here). `low` runs it at low priority, as every gated command but a solo run.
     pub fn prepare(
         program: &str,
         args: &[String],
         cpu_percent: u32,
         mem_bytes: u64,
+        low: bool,
     ) -> (Command, Option<Job>, Option<String>) {
         let mut report = None;
         let mut command = match (scope(cpu_percent, mem_bytes), std::env::current_exe()) {
@@ -67,7 +68,9 @@ impl Job {
         // SAFETY: only async-signal-safe calls between fork and exec.
         unsafe {
             command.pre_exec(move || {
-                libc::nice(10);
+                if low {
+                    libc::nice(10);
+                }
                 libc::setpgid(0, 0);
                 if terminal {
                     libc::signal(libc::SIGTTOU, libc::SIG_IGN);

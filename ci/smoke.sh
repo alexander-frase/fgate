@@ -26,6 +26,16 @@ wait
 "$F" status
 grep -q "	now	" "$FGATE_DIR/history.log" || { echo "no now run in the history"; exit 1; }
 
+# A solo run waits for the running build, and a --now command that comes after it waits for the solo run.
+O="$FGATE_DIR/order"
+"$F" sh -c "sleep 3; echo build >> '$O'" &
+sleep 1
+"$F" --solo sh -c "echo solo-start >> '$O'; sleep 2; echo solo-end >> '$O'" &
+sleep 1
+"$F" --now sh -c "echo now >> '$O'"
+wait
+[ "$(tr '\n' ' ' < "$O")" = "build solo-start solo-end now " ] || { echo "solo run out of order: $(cat "$O")"; exit 1; }
+
 # Output that goes to a pipe is passed on unchanged and kept for `fgate peek`, also after the run.
 [ "$("$F" sh -c 'echo kept-line; echo err-line >&2' 2>/dev/null)" = "kept-line" ] || { echo "output not passed on"; exit 1; }
 "$F" peek "$(basename "$PWD")" | grep -q "err-line" || { echo "peek showed no kept output"; exit 1; }

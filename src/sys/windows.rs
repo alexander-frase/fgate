@@ -53,16 +53,18 @@ const JOB_OBJECT_MEMORY_USAGE_INFORMATION: i32 = 28;
 
 impl Job {
     /// The command to run and the job it runs in, or why it runs without one. fgate itself joins the job, and
-    /// everything it starts from then on joins too.
+    /// everything it starts from then on joins too. `low` runs it below normal priority, as every gated command
+    /// but a solo run.
     pub fn prepare(
         program: &str,
         args: &[String],
         cpu_percent: u32,
         mem_bytes: u64,
+        low: bool,
     ) -> (Command, Option<Job>, Option<String>) {
         let mut command = Command::new(self::program(program));
         command.args(args);
-        match Job::contain(cpu_percent, mem_bytes) {
+        match Job::contain(cpu_percent, mem_bytes, low) {
             Ok(job) => (command, Some(job), None),
             Err(e) => (
                 command,
@@ -84,7 +86,7 @@ impl Job {
         false
     }
 
-    fn contain(cpu_percent: u32, mem_bytes: u64) -> Result<Job, String> {
+    fn contain(cpu_percent: u32, mem_bytes: u64, low: bool) -> Result<Job, String> {
         // SAFETY: plain Win32 calls on a handle owned here; the structs are plain data, sized as the API expects.
         unsafe {
             let handle = CreateJobObjectW(std::ptr::null(), std::ptr::null());
@@ -94,9 +96,11 @@ impl Job {
             let job = Job(handle);
 
             let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
-            limits.BasicLimitInformation.LimitFlags =
-                JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_PRIORITY_CLASS;
-            limits.BasicLimitInformation.PriorityClass = BELOW_NORMAL_PRIORITY_CLASS;
+            limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            if low {
+                limits.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_PRIORITY_CLASS;
+                limits.BasicLimitInformation.PriorityClass = BELOW_NORMAL_PRIORITY_CLASS;
+            }
             if mem_bytes > 0 {
                 limits.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_JOB_MEMORY;
                 limits.JobMemoryLimit = mem_bytes as usize;

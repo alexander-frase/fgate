@@ -17,6 +17,8 @@ Several agents share this machine, so heavy commands take turns through
 - **A script that builds runs under fgate as a whole**: `fgate python build.py`. Commands it starts don't queue again.
 - **Small commands skip the line with `fgate --now`** (2 GB memory ceiling). If fgate says it was too big, run it
   again without `--now`.
+- **Performance measurements run alone with `fgate --solo`** (fps, frame times, benchmarks): it waits until no other
+  gated job runs, and nothing else starts until it ends. Keep them short; never use it for builds or tests.
 - **Waiting is normal.** When `fgate status` shows a line, start the command in the background and wait for it.
   Don't poll, cancel and retry, or work around the gate (`FGATE_OFF`, another tool, splitting the command).
 - **Out of memory?** If fgate ends with "it reached the … GB ceiling", the gate's ceiling stopped it, not the code.

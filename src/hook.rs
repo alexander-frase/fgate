@@ -192,7 +192,9 @@ pub fn run(args: &[String]) -> ExitCode {
             .to_string(),
         Need::Gpu => "This program takes turns on the GPU through the build gate. Put `fgate --gpu` right before \
              it, for example `fgate --gpu <program> <args>`; a script that starts it runs under `fgate --gpu` as a \
-             whole. If `fgate status` shows a line, run it in the background (run_in_background)."
+             whole. To measure its performance (fps, frame times), use `fgate --solo <program> <args>` instead: \
+             it waits until no other gated job runs and keeps the machine to itself while it runs, so keep such a \
+             run short. If `fgate status` shows a line, run it in the background (run_in_background)."
             .to_string(),
         Need::Push(branch) => format!(
             "Nothing is pushed to `{branch}` directly. Commit on your own branch, push that, and let it land \
@@ -556,6 +558,10 @@ mod tests {
         );
         assert_eq!(
             ungated("fgate --gpu target/debug/my_viewer.exe pump --shots"),
+            None
+        );
+        assert_eq!(
+            ungated("fgate --solo target/debug/my_game.exe --bench 60"),
             None
         );
         assert_eq!(
