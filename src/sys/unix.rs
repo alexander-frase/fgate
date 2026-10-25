@@ -618,7 +618,7 @@ mod tests {
     #[test]
     fn a_job_sees_its_processes_and_ends_them() {
         let args = ["-c".to_string(), "sleep 30 & sleep 30".to_string()];
-        let (mut command, job, _) = Job::prepare("sh", &args, 0, 0);
+        let (mut command, job, _) = Job::prepare("sh", &args, 0, 0, true);
         let job = job.unwrap();
         let mut child = command.spawn().unwrap();
         job.started(&child);
