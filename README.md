@@ -14,6 +14,7 @@ macOS.
 fgate cargo test -p my_crate        waits for a build slot, then runs the command unchanged
 fgate --gpu my_game.exe --shots     waits for the GPU slot (games, renderers, screenshot scripts)
 fgate --now cargo publish           skips the line: small commands, within a small memory ceiling
+fgate --solo my_game.exe --bench    alone on the machine: a performance measurement, while nothing else runs
 fgate status                        who holds the slots, who is waiting
 fgate watch                         the same, live: memory, CPU, each job's usage and output, recent runs
 fgate peek [name]                   a running job's output as it comes, or how a finished run ended
@@ -65,6 +66,27 @@ version, and an option fgate doesn't know is refused at once rather than run as 
 
 Agents name their place by their folder, or by their worktree for checkouts under `.claude/worktrees/<name>`,
 so the status shows `spaceport-sp1: cargo build` rather than a process id.
+
+### Measuring performance: `--solo`
+
+Average fps over a minute means nothing while three other agents build beside the game. `fgate --solo` gives one run
+the machine to itself:
+
+```text
+fgate: waiting for the machine to be quiet for a solo run, nothing new starts meanwhile; running: build: smelter-2: cargo build --release (1m40s)
+fgate: solo slot 0 after 1m52s in line — my_game.exe --bench 60
+fgate: alone on the machine: no other gated job starts until this ends or 10 minutes pass (solo_minutes); normal priority, no CPU ceiling (other programs, such as agents themselves, still run)
+```
+
+- From the moment it asks, nothing new starts: builds, GPU runs and `--now` commands wait, so a busy line can't keep
+  it waiting for ever. The jobs that are running finish first; fgate doesn't pause or end them.
+- It runs at normal priority, without the CPU ceiling, which would spoil what it measures. The memory ceiling stays.
+- After `solo_minutes` (10) it hands the machine back: it goes on, but fgate says that others may start again, so what
+  it measures from then on is no longer alone. A game that hangs can't hold up every agent. `solo_minutes = 0` never
+  hands it back.
+- Only gated commands wait. The agents themselves, an editor, or a build started without fgate keep running.
+
+Keep solo runs short, and never use them for builds: every other agent waits while one runs.
 
 ### Seeing what a job is doing: `fgate peek`
 
@@ -163,7 +185,8 @@ sources, not the packaged copy
 ## How it works
 
 - **Kinds of slot.** Build slots for `cargo` and test runs, a GPU slot for games, renderers and screenshot
-  scripts, so a screenshot run doesn't wait behind a build, and `now` slots for small commands that skip the line.
+  scripts, so a screenshot run doesn't wait behind a build, `now` slots for small commands that skip the line, and
+  one `solo` slot for a run that needs the machine to itself.
 - **A fair line.** Waiters are served in the order they arrived. Places in line and slots are file locks in
   fgate's folder, which the system drops when a process ends however it ends. A crashed or killed agent never
   leaves a slot taken.
@@ -212,6 +235,7 @@ waiting command reads it again when it changes. `fgate status` shows where the f
 | `switch_clean`      | 1                   | clean a shared target's workspace crates when another checkout built them (0 = off) |
 | `keep_bins`         | 1                   | copy a shared build's executables into the checkout's `target/fgate-bin/` (0 = off) |
 | `capture`           | 1                   | keep a job's last output lines for `peek` and `watch`, unless it goes to a terminal (0 = off) |
+| `solo_minutes`      | 10                  | a `--solo` run hands the machine back after this many minutes (0 = never) |
 
 Any setting can be overridden for one command with an environment variable such as `FGATE_MEM_GB=16`.
 `FGATE_DIR` points fgate at another folder, for trying it out without touching the real line.
@@ -318,7 +342,7 @@ A `fgate watch` that is open keeps showing the old version: restart it.
 | | Windows | Linux | macOS |
 | --- | --- | --- | --- |
 | Fair line, slots, `--now`, memory waiting, night limits, `watch`, hook | yes | yes | yes |
-| Low priority | below normal | nice 10 | nice 10 |
+| Low priority (not `--solo`) | below normal | nice 10 | nice 10 |
 | Everything a command started ends with it | Windows job | process group | process group |
 | Hard memory and CPU ceiling | Windows job | systemd scope (cgroups), with a systemd user session | no |
 | Memory and CPU use per command | job accounting | process group (`/proc`), scope peak | process group |

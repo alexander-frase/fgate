@@ -311,11 +311,13 @@ impl View {
         };
         let w = left.w - 4;
 
-        // A panel for each kind of slot (`now` only while one runs); the line too when there is no sidebar.
+        // A panel for each kind of slot (`now` and `solo` only while one runs); the line too when there is no
+        // sidebar.
         let mut panels: Vec<(&str, Spans, Rows)> = Vec::new();
         for (class, holders) in &state.slots {
             let taken = holders.iter().filter(|h| h.is_some()).count();
-            if *class == Class::Now && taken == 0 {
+            let sometimes = matches!(class, Class::Now | Class::Solo);
+            if sometimes && taken == 0 {
                 continue;
             }
             let mut rows = Rows::new();
@@ -341,7 +343,7 @@ impl View {
                     rows.push((row, bg));
                 }
             }
-            if *class != Class::Now {
+            if !sometimes {
                 if let Some(row) = free_row(holders, w) {
                     rows.push((row, PANEL));
                 }
@@ -350,6 +352,16 @@ impl View {
                 ink(if taken > 0 { TEXT } else { MUTED }),
                 format!("{taken}/{} busy", holders.len()),
             )];
+            if *class == Class::Solo {
+                status.push(if gate::handed_back(config) {
+                    (ink(MUTED), " · handed back, others run beside it".into())
+                } else {
+                    (
+                        ink(AMBER),
+                        " · alone on the machine, nothing else starts".into(),
+                    )
+                });
+            }
             let waiters = state.waiting.iter().filter(|(c, _)| c == class).count();
             if waiters > 0 {
                 status.push((ink(AMBER), format!(" · {waiters} waiting")));

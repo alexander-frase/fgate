@@ -25,6 +25,9 @@ pub enum Class {
     Gpu,
     /// Small commands that skip the line (`fgate --now`), held to a small memory ceiling.
     Now,
+    /// A run that has the machine to itself (`fgate --solo`), such as a performance measurement: while it waits
+    /// nothing new starts, and while it runs nothing else does, until it hands the machine back.
+    Solo,
 }
 
 impl Class {
@@ -33,6 +36,7 @@ impl Class {
             Class::Build => "build",
             Class::Gpu => "gpu",
             Class::Now => "now",
+            Class::Solo => "solo",
         }
     }
 
@@ -41,11 +45,12 @@ impl Class {
             Class::Build => config.build_slots,
             Class::Gpu => config.gpu_slots,
             Class::Now => config.now_slots,
+            Class::Solo => 1,
         }
     }
 }
 
-pub const CLASSES: [Class; 3] = [Class::Build, Class::Gpu, Class::Now];
+pub const CLASSES: [Class; 4] = [Class::Build, Class::Gpu, Class::Now, Class::Solo];
 
 fn open(path: &Path) -> Option<File> {
     if let Some(dir) = path.parent() {
@@ -166,13 +171,78 @@ fn holders(config: &Config, class: Class) -> Vec<Option<String>> {
         .collect()
 }
 
+/// Where a solo run that has handed the machine back says so; it means nothing while the solo slot is free.
+fn handed_back_path(config: &Config) -> PathBuf {
+    config.dir.join("slots").join("solo-0.handed-back")
+}
+
+/// Whether the solo run going now has handed the machine back, so others may run beside it.
+pub fn handed_back(config: &Config) -> bool {
+    handed_back_path(config).exists()
+}
+
+/// A solo run lets others run again (after `solo_minutes`), while it goes on.
+pub fn hand_back(config: &Config) {
+    let _ = fs::write(handed_back_path(config), "");
+}
+
+/// Why a command other than a solo run must wait for one, and the same without the ticking clock, or `None`. A
+/// solo run that has handed the machine back holds up nobody, and neither does the next one in line while it runs,
+/// so a run that hangs can't hold the machine through the next.
+fn solo_blocks(config: &Config) -> Option<(String, String)> {
+    match holders(config, Class::Solo).into_iter().next().flatten() {
+        Some(_) if handed_back(config) => None,
+        Some(text) => Some((
+            format!(
+                "a solo run has the machine until it ends: {}",
+                summary(&text)
+            ),
+            format!("solo {}", who(&text)),
+        )),
+        None => line_up(config, Class::Solo).first().map(|(_, text)| {
+            (
+                format!(
+                    "a solo run waits for the machine to be quiet, nothing new starts until it is done: {}",
+                    summary(text)
+                ),
+                format!("solo waiting {}", who(text)),
+            )
+        }),
+    }
+}
+
+/// Every job running that is not a solo run, which a solo run waits for.
+fn others_running(config: &Config) -> Vec<(Class, String)> {
+    CLASSES
+        .iter()
+        .filter(|&&c| c != Class::Solo)
+        .flat_map(|&c| {
+            holders(config, c)
+                .into_iter()
+                .flatten()
+                .map(move |t| (c, t))
+        })
+        .collect()
+}
+
 /// A slot this process holds; dropping it (or ending) frees it.
 pub struct Held {
-    _file: File,
+    file: Option<File>,
     pub index: usize,
     path: PathBuf,
     /// Where the usage line starts, just after what the holder wrote.
     usage_at: u64,
+    /// A solo run's hand-back marker, cleared before the slot is given back.
+    handed_back: Option<PathBuf>,
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        if let Some(path) = &self.handed_back {
+            let _ = fs::remove_file(path);
+        }
+        drop(self.file.take());
+    }
 }
 
 impl Held {
@@ -433,7 +503,30 @@ pub fn acquire(config: &Config, class: Class, line: &str) -> Held {
         // latter changes, or after a minute.
         let mut why = String::new();
         let mut situation = String::new();
-        if position < free.len() {
+        // Everything waits for a solo run; a solo run waits for everything else to end.
+        let others = if class == Class::Solo {
+            others_running(config)
+        } else {
+            Vec::new()
+        };
+        if let Some((reason, key)) = (class != Class::Solo)
+            .then(|| solo_blocks(config))
+            .flatten()
+        {
+            why = format!("waiting: {reason}");
+            situation = key;
+        } else if position < free.len() && !others.is_empty() {
+            let running: Vec<String> = others
+                .iter()
+                .map(|(c, t)| format!("{}: {}", c.name(), summary(t)))
+                .collect();
+            why = format!(
+                "waiting for the machine to be quiet for a solo run, nothing new starts meanwhile; running: {}",
+                running.join(" | ")
+            );
+            let running: Vec<String> = others.iter().map(|(_, t)| who(t)).collect();
+            situation = format!("quiet {}", running.join("|"));
+        } else if position < free.len() {
             let anyone_running = CLASSES
                 .iter()
                 .any(|&c| c != class && holders(config, c).iter().any(Option::is_some))
@@ -457,18 +550,31 @@ pub fn acquire(config: &Config, class: Class, line: &str) -> Held {
                         continue;
                     };
                     if try_lock(&file) {
+                        // A solo run and another job may each have taken a slot as the other looked: each looks
+                        // again once it holds its own, so at least one sees the other and gives its slot back.
+                        let quiet = if class == Class::Solo {
+                            let _ = fs::remove_file(handed_back_path(config));
+                            others_running(config).is_empty()
+                        } else {
+                            solo_blocks(config).is_none()
+                        };
+                        if !quiet {
+                            unlock(&file);
+                            break;
+                        }
                         let text = describe(line);
                         write(&mut file, &text);
                         drop(ticket);
                         return Held {
-                            _file: file,
+                            file: Some(file),
                             index,
                             path: slot_path(config, class, index),
                             usage_at: text.len() as u64,
+                            handed_back: (class == Class::Solo).then(|| handed_back_path(config)),
                         };
                     }
                 }
-                // Someone took it between looking and taking: look again shortly.
+                // Someone took it between looking and taking, or a solo run came in: look again shortly.
                 std::thread::sleep(POLL);
                 continue;
             }
@@ -516,11 +622,18 @@ pub fn print_status(config: &Config) {
     }
     for class in CLASSES {
         for (i, holder) in holders(config, class).iter().enumerate() {
-            // Free `now` slots are many and say nothing.
-            if class == Class::Now && holder.is_none() {
+            // Free `now` slots are many and say nothing, and the solo slot matters only while it is taken.
+            if matches!(class, Class::Now | Class::Solo) && holder.is_none() {
                 continue;
             }
-            let text = holder.as_deref().map_or("free".into(), summary);
+            let mut text = holder.as_deref().map_or("free".into(), summary);
+            if class == Class::Solo {
+                text += if handed_back(config) {
+                    " — handed the machine back, others run beside it"
+                } else {
+                    " — has the machine, nothing else starts"
+                };
+            }
             println!("  {} slot {i}: {text}", class.name());
         }
         for (n, (_, text)) in line_up(config, class).iter().enumerate() {

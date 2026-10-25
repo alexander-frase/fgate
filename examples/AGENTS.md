@@ -20,6 +20,10 @@ Several agents share this machine. Builds must never run it out of memory, so he
   fgate as a whole: `fgate --gpu python take_screenshots.py`.
 - **Small commands skip the line with `fgate --now`**: `cargo fmt`, `cargo publish`, a quick tool run. They get a
   2 GB memory ceiling; if fgate says a `--now` command was too big to skip the line, run it again without `--now`.
+- **Performance measurements run with `fgate --solo`**: fps over a minute, frame times, a benchmark.
+  `fgate --solo target/release/my_game --bench 60` waits until no other gated job runs, then has the machine to
+  itself: nothing else starts until it ends. Keep such runs short (after 10 minutes others run beside it again), and
+  never use `--solo` for builds or tests.
 - **Waiting is normal.** When `fgate status` shows a line, start the command in the background and wait for it to
   finish. Don't poll it, don't cancel and retry, and don't work around the gate (another tool, `FGATE_OFF`, or a
   command split up to avoid it).

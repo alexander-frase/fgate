@@ -3,6 +3,7 @@
 //! ```text
 //! fgate cargo test -p my_crate         a build slot: cargo build/check/test/clippy/run, test runs
 //! fgate --gpu <program> …              the GPU slot: games, renderers, screenshot scripts
+//! fgate --solo <program> …             alone on the machine, for performance measurements
 //! fgate status                         who holds the slots, who is waiting
 //! fgate watch                          the same, live, with memory, CPU, each job's output and recent runs
 //! fgate peek [name]                    a job's output as it comes, or how a finished run ended
@@ -36,6 +37,9 @@ const HELP: &str = "fgate: the build gate (https://github.com/alexander-frase/fg
   fgate --gpu <command> […]    run a GPU program (game, renderer, screenshot script) in the GPU slot
   fgate --now <command> […]    run a small command at once, skipping the line, within a small memory
                                ceiling (now_mem_gb); one that needs more belongs in the line
+  fgate --solo <command> […]   run a command alone on the machine, such as a performance measurement: nothing
+                               new starts while it waits, the running jobs finish, then nothing else runs until it
+                               ends or for solo_minutes; normal priority, no CPU ceiling
   fgate --version              print fgate's version
   fgate status                 show the slots and the line
   fgate watch                  a live view of the slots, the line and recent runs (Ctrl+C ends it)
@@ -90,7 +94,9 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         // An option fgate doesn't know is a mistake, not a program to wait in line for.
-        Some(option) if option.starts_with('-') && option != "--gpu" && option != "--now" => {
+        Some(option)
+            if option.starts_with('-') && !["--gpu", "--now", "--solo"].contains(&option) =>
+        {
             eprintln!("fgate: unknown option {option}\n{HELP}");
             ExitCode::from(2)
         }
@@ -103,6 +109,7 @@ fn main() -> ExitCode {
         Some("hook") => hook::run(&args[1..]),
         Some("--gpu") => run(gate::Class::Gpu, &args[1..]),
         Some("--now") => run(gate::Class::Now, &args[1..]),
+        Some("--solo") => run(gate::Class::Solo, &args[1..]),
         Some(_) => run(gate::Class::Build, &args),
     }
 }
@@ -113,7 +120,13 @@ fn run(class: gate::Class, command: &[String]) -> ! {
         std::process::exit(2);
     };
     // Already inside a gated command: run straight away, it owns a slot.
-    if std::env::var_os(HELD_VAR).is_some() {
+    if let Some(held) = std::env::var_os(HELD_VAR) {
+        if class == gate::Class::Solo && held != "solo" {
+            eprintln!(
+                "fgate: --solo inside a gated command runs in that command's {} slot, not alone on the machine",
+                held.to_string_lossy()
+            );
+        }
         let config = Config::load();
         let shared = shared(&config, command);
         let lock = shared.as_ref().and_then(switch::lock);
@@ -144,7 +157,10 @@ fn run(class: gate::Class, command: &[String]) -> ! {
 
     let mem_gb = config.mem_gb_for(class);
     let mem_bytes = mem_gb as u64 * (1u64 << 30);
-    let (mut child, job, note) = sys::Job::prepare(program, args, config.cpu_percent, mem_bytes);
+    // A solo run is alone on the machine: nothing to make room for, and a ceiling would spoil what it measures.
+    let solo = class == gate::Class::Solo;
+    let cpu_percent = if solo { 0 } else { config.cpu_percent };
+    let (mut child, job, note) = sys::Job::prepare(program, args, cpu_percent, mem_bytes, !solo);
     if let Some(note) = note {
         eprintln!("fgate: {note}");
     }
@@ -183,6 +199,17 @@ fn run(class: gate::Class, command: &[String]) -> ! {
         if config.night { "(night limits) " } else { "" },
         line
     );
+    if solo {
+        eprintln!(
+            "fgate: alone on the machine: no other gated job starts until this ends{}; normal priority, no CPU \
+             ceiling (other programs, such as agents themselves, still run)",
+            if config.solo_minutes > 0 {
+                format!(" or {} pass (solo_minutes)", minutes(config.solo_minutes))
+            } else {
+                String::new()
+            }
+        );
+    }
 
     // Says what the job uses once a second, for `fgate watch`, until the slot is given back.
     let held = Arc::new(Mutex::new(Some(held)));
@@ -196,6 +223,22 @@ fn run(class: gate::Class, command: &[String]) -> ! {
                     _ => break,
                 }
                 std::thread::sleep(Duration::from_secs(1));
+            }
+        });
+    }
+    // A solo run hands the machine back after solo_minutes, so one that hangs can't hold up every agent.
+    if solo && config.solo_minutes > 0 {
+        let held = held.clone();
+        let n = config.solo_minutes;
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(n as u64 * 60));
+            if let Ok(Some(_)) = held.lock().as_deref() {
+                gate::hand_back(&Config::load());
+                eprintln!(
+                    "fgate: the solo run has had the machine for {} (solo_minutes): other jobs may \
+                     start again, so from here on it no longer runs alone",
+                    minutes(n)
+                );
             }
         });
     }
@@ -322,6 +365,15 @@ fn code(status: &std::process::ExitStatus) -> i32 {
         return 128 + signal;
     }
     status.code().unwrap_or(1)
+}
+
+/// `1 minute`, `10 minutes`.
+fn minutes(n: u32) -> String {
+    if n == 1 {
+        "1 minute".into()
+    } else {
+        format!("{n} minutes")
+    }
 }
 
 /// The command as the status shows it: the program without its folder, on one line, at most 400 characters.
