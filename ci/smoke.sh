@@ -56,4 +56,33 @@ build b
 [ "$(ran a)" = "checkout a" ] || { echo "b's build changed a's kept executable"; exit 1; }
 [ "$(ran b)" = "checkout b" ] || { echo "b's build kept no executable of its own"; exit 1; }
 build b | grep -q "(unchanged)" || { echo "an unchanged executable was copied again"; exit 1; }
+
+# Builds into one shared target take turns per profile folder, as cargo's own locks do. With two build slots, a dev
+# build waits for the dev build running there without taking the free slot, and a release build behind it goes past.
+# A stand-in cargo finds no workspace, and "builds" by noting when it starts and ends.
+printf 'build_slots = 2\nnight_build_slots = 2\nmin_free_gb = 0\nnight_min_free_gb = 0\n' > "$FGATE_DIR/config.txt"
+FC="$(mktemp -d)"
+cat > "$FC/fake.sh" <<'EOF'
+case "$1" in locate-project|metadata) exit 1 ;; esac
+echo "$FAKE-start" >> "$ORDER"; sleep "$FAKE_SECONDS"; echo "$FAKE-end" >> "$ORDER"
+EOF
+case "$(uname -s)" in
+    MINGW*|MSYS*|CYGWIN*)
+        C="$FC/cargo.cmd"
+        printf '@"%s" "%s" %%*\r\n' "$(cygpath -w "$BASH")" "$(cygpath -w "$FC/fake.sh")" > "$C" ;;
+    *)
+        C="$FC/cargo"
+        printf '#!/bin/bash\nexec bash "%s" "$@"\n' "$FC/fake.sh" > "$C"
+        chmod +x "$C" ;;
+esac
+export ORDER="$FC/order"
+FAKE=a FAKE_SECONDS=6 "$F" "$C" build --target-dir "$FC/target" &
+sleep 2
+FAKE=b FAKE_SECONDS=0 "$F" "$C" test --target-dir "$FC/target" &
+sleep 2
+"$F" status | grep -q "waits for another build into" || { "$F" status; echo "the waiting dev build isn't shown"; exit 1; }
+FAKE=c FAKE_SECONDS=0 "$F" "$C" build --release --target-dir "$FC/target"
+wait
+[ "$(tr '\n' ' ' < "$ORDER")" = "a-start c-start c-end a-end b-start b-end " ] ||
+    { echo "builds into one target out of order: $(tr '\n' ' ' < "$ORDER")"; exit 1; }
 echo "smoke test passed"

@@ -54,8 +54,10 @@ const HELP: &str = "fgate: the build gate (https://github.com/alexander-frase/fg
 A compiling cargo command into a target directory other checkouts share (CARGO_TARGET_DIR) first cleans this
 workspace's own packages there when another checkout built that profile last (switch_clean). After it, the
 workspace's executables are copied into the checkout, target/fgate-bin/<profile>/, where no other checkout's
-build deletes them (keep_bins). The clean, the build and the keep hold the target's lock, so another checkout's build
-can't come in between. A gated command that is not cargo (a script) gets fgate's `cargo` first on its PATH, so the
+build deletes them (keep_bins). The clean, the build and the keep hold the lock of the profile folder they build in
+(target/debug, target/release), so another checkout's build can't come in between. A build whose folder another
+build is using keeps its place in line without taking a slot, and the jobs behind it that build elsewhere go first
+meanwhile. A gated command that is not cargo (a script) gets fgate's `cargo` first on its PATH, so the
 cargo it runs gets the same clean and keep. After `cargo publish` or `cargo package`, the workspace's packages are
 cleaned, so the next build compiles the real sources, not the copy the verify step built.
 When fgate's output goes to a pipe or file (an agent's shell), the command's output is passed on unchanged and its
@@ -128,13 +130,15 @@ fn run(class: gate::Class, command: &[String]) -> ! {
             );
         }
         let config = Config::load();
+        // It holds a slot already, so it waits here for its target lock (none when its parent holds that one).
+        let lock = switch::lock_path(command)
+            .and_then(|path| switch::lock(&path, &gate::describe(&short(command))));
         let shared = shared(&config, command);
-        let lock = shared.as_ref().and_then(switch::lock);
         prepare(&config, shared.as_ref());
         let mut child = Command::new(sys::program(program));
         child.args(args);
         if let Some(lock) = &lock {
-            child.env(switch::LOCK_VAR, &lock.target);
+            child.env(switch::LOCK_VAR, lock.passed_on());
         }
         let status = child.status();
         after(&config, command, shared.as_ref(), &status);
@@ -145,14 +149,14 @@ fn run(class: gate::Class, command: &[String]) -> ! {
     let config = Config::load();
     let line = short(command);
     let waited = Instant::now();
-    let held = gate::acquire(&config, class, &line);
+    // A cargo build into a shared target directory takes that profile folder's lock with its slot, and holds it
+    // from the clean to the keep, so another checkout's build can't come in between.
+    let (held, lock) = gate::acquire(&config, class, &line, switch::lock_path(command).as_deref());
     let waited = waited.elapsed();
     // The settings as they are now: they may have changed while the command waited.
     let config = Config::load();
     // A target directory shared with other checkouts: their builds of this workspace's crates must not be reused.
-    // Its lock is held from the clean to the keep, so another checkout's build can't come in between.
     let shared = shared(&config, command);
-    let lock = shared.as_ref().and_then(switch::lock);
     prepare(&config, shared.as_ref());
 
     let mem_gb = config.mem_gb_for(class);
@@ -167,7 +171,7 @@ fn run(class: gate::Class, command: &[String]) -> ! {
     let job = job.map(Arc::new);
     child.env(HELD_VAR, class.name());
     if let Some(lock) = &lock {
-        child.env(switch::LOCK_VAR, &lock.target);
+        child.env(switch::LOCK_VAR, lock.passed_on());
     }
     // A command that is not cargo (a script) may run cargo itself: its cargo comes through fgate's shim.
     if !switch::is_cargo(command) && (config.switch_clean != 0 || config.keep_bins != 0) {
