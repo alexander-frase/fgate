@@ -20,10 +20,15 @@
 //!
 //! The clean, the build and the keep belong together: with two build slots, another checkout's clean could run
 //! between this build and its keep (deleting what it built), or between its own clean and build, so that the record
-//! names one checkout while the crates are another's. So a build into a shared target holds that target's lock
-//! (`.fgate-lock` in it) from before its clean until after its keep. Cargo lets only one build use a target directory
-//! at a time anyway, so this costs no parallel building; only the waiting is fgate's instead of cargo's.
+//! names one checkout while the crates are another's. So a build into a shared target holds a lock there from before
+//! its clean until after its keep: one per profile folder (`.fgate-lock-debug`, `.fgate-lock-release`), the same
+//! folders cargo itself locks while it builds. A dev build and a release build into one target run side by side, as
+//! cargo lets them. Two dev builds can't, so the second waits in fgate's line rather than in a slot, blocked in
+//! cargo, and the line lets later jobs that build elsewhere go past it meanwhile (`gate`).
 
+use std::ffi::OsString;
+use std::fs::File;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::SystemTime;
@@ -31,51 +36,148 @@ use std::time::SystemTime;
 /// The record in the target directory: one line per profile, `<profile key>\t<workspace root>`.
 const STAMP: &str = ".fgate-checkouts";
 
-/// The lock a build holds on a shared target directory from its clean to its keep.
+/// The start of the lock files a build holds in a shared target directory from its clean to its keep; the profile
+/// folder's name follows (`.fgate-lock-release`).
 const LOCK: &str = ".fgate-lock";
 
-/// Set on a command that holds a shared target's lock: the target, so a nested `fgate cargo …` in it doesn't wait for
-/// its own parent.
+/// Set on a command that holds locks in shared targets: those lock files (a path list), so a nested
+/// `fgate cargo …` that needs one of them runs under its parent's lock instead of waiting for its own parent.
 pub const LOCK_VAR: &str = "FGATE_TARGET_LOCK";
 
-/// A held lock on a shared target directory; dropping it (or the process ending) gives it back.
+/// A held lock on a profile folder in a shared target directory; dropping it (or the process ending) gives it back.
 pub struct TargetLock {
-    _file: std::fs::File,
-    pub target: PathBuf,
+    _file: File,
+    pub path: PathBuf,
 }
 
-/// Takes the shared target's lock, waiting while another build holds it. None when this command's parent already
-/// holds it, or the lock file can't be made (the build then goes ahead without it).
-pub fn lock(shared: &Shared) -> Option<TargetLock> {
-    let target = &shared.target;
-    if std::env::var_os(LOCK_VAR).is_some_and(|held| same(&held.to_string_lossy(), target)) {
+impl TargetLock {
+    /// `LOCK_VAR` for what the holder runs: the locks it was given, and this one.
+    pub fn passed_on(&self) -> OsString {
+        let inherited = std::env::var_os(LOCK_VAR).unwrap_or_default();
+        let held = std::env::split_paths(&inherited).chain([self.path.clone()]);
+        std::env::join_paths(held).unwrap_or_else(|_| self.path.clone().into_os_string())
+    }
+}
+
+/// What came of trying to take a lock.
+pub enum Take {
+    Held(TargetLock),
+    /// Another build holds it.
+    Busy,
+    /// The lock file can't be made: the build goes ahead without it.
+    Without,
+}
+
+/// The lock a cargo command needs while it builds into a target directory set from outside its workspace
+/// (`--target-dir`, `CARGO_TARGET_DIR`, `CARGO_BUILD_TARGET_DIR`): the lock file of the profile folder it builds
+/// in. A build for another target triple shares the host's lock, since cargo builds its build scripts in the host's
+/// folder and locks that too. None for a command that doesn't build, builds into its workspace's own `target/`, or
+/// runs under a parent that holds this lock already.
+pub fn lock_path(command: &[String]) -> Option<PathBuf> {
+    let (sub, build) = parse_any(command)?;
+    let builds =
+        COMPILING.contains(&sub.as_str()) || sub == "install" || publishes(command).is_some();
+    if !builds {
         return None;
     }
-    std::fs::create_dir_all(target).ok()?;
-    let file = std::fs::OpenOptions::new()
+    let target = target_dir(&build)?;
+    let target = std::path::absolute(&target).unwrap_or(target);
+    let path = target.join(format!("{LOCK}-{}", build.folder()));
+    let inherited = std::env::var_os(LOCK_VAR).unwrap_or_default();
+    if std::env::split_paths(&inherited).any(|held| same(&held.to_string_lossy(), &path)) {
+        return None;
+    }
+    Some(path)
+}
+
+/// A lock file's path as every waiter writes it, so two waiters' locks compare as text.
+pub fn normal(path: &Path) -> String {
+    let s = path.to_string_lossy().replace('\\', "/");
+    if cfg!(windows) { s.to_lowercase() } else { s }
+}
+
+/// `E:\code\game\target\release`: the profile folder a lock file guards, for messages, written with the lock path's
+/// own slashes.
+pub fn lock_name(path: &Path) -> String {
+    let path = path.to_string_lossy();
+    let (dir, file) = path.rsplit_once(['/', '\\']).unwrap_or(("", &path));
+    let folder = file
+        .strip_prefix(LOCK)
+        .unwrap_or(file)
+        .trim_start_matches('-');
+    // The separator the path itself uses there.
+    let slash = &path[dir.len()..path.len() - file.len()];
+    format!("{dir}{slash}{folder}")
+}
+
+fn open_lock(path: &Path) -> Option<File> {
+    std::fs::create_dir_all(path.parent()?).ok()?;
+    File::options()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
-        .open(target.join(LOCK))
-        .ok()?;
+        .open(path)
+        .ok()
+}
+
+/// Takes the lock if it is free, and writes `text` (who holds it) into it for those who wait.
+pub fn take(path: &Path, text: &str) -> Take {
+    let Some(mut file) = open_lock(path) else {
+        return Take::Without;
+    };
+    if !crate::sys::try_lock(&file) {
+        return Take::Busy;
+    }
+    // The lock sits far past the text (as a slot's does), so the text can be written and read while it is held.
+    let _ = file.set_len(0);
+    let _ = file.write_all(text.as_bytes());
+    Take::Held(TargetLock {
+        _file: file,
+        path: path.to_path_buf(),
+    })
+}
+
+/// Whether a build holds the lock now.
+pub fn busy(path: &Path) -> bool {
+    let Ok(file) = File::options().read(true).write(true).open(path) else {
+        return false;
+    };
+    if crate::sys::try_lock(&file) {
+        crate::sys::unlock(&file);
+        false
+    } else {
+        true
+    }
+}
+
+/// What the lock's holder wrote: since when, where from, what (as a slot says it).
+pub fn holder(path: &Path) -> Option<String> {
+    std::fs::read_to_string(path).ok().filter(|t| !t.is_empty())
+}
+
+/// Takes the lock, waiting while another build holds it, for a command that already holds a slot (a nested
+/// `fgate cargo …`, a script's cargo). None when the lock file can't be made: the build then goes ahead without it.
+pub fn lock(path: &Path, text: &str) -> Option<TargetLock> {
     let started = std::time::Instant::now();
     let mut said = false;
-    while !crate::sys::try_lock(&file) {
+    loop {
+        match take(path, text) {
+            Take::Held(lock) => return Some(lock),
+            Take::Without => return None,
+            Take::Busy => {}
+        }
         if !said && started.elapsed() > std::time::Duration::from_secs(1) {
             eprintln!(
                 "fgate: waiting for another build into {} to finish (a build's clean, build and kept executables go \
-                 together)",
-                target.display()
+                 together){}",
+                lock_name(path),
+                holder(path).map_or(String::new(), |t| format!(": {}", crate::gate::summary(&t)))
             );
             said = true;
         }
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
-    Some(TargetLock {
-        _file: file,
-        target: target.clone(),
-    })
 }
 
 /// Cargo's subcommands (and their aliases) that compile the workspace.
@@ -102,6 +204,11 @@ pub struct Build {
 }
 
 impl Build {
+    /// The profile folder without the target triple's: `debug`, `release`, a custom profile's name.
+    fn folder(&self) -> &str {
+        self.key.rsplit('/').next().unwrap_or(&self.key)
+    }
+
     fn cargo(&self) -> Command {
         let mut command = Command::new(&self.cargo);
         if let Some(toolchain) = &self.toolchain {
@@ -164,6 +271,9 @@ fn parse_any(command: &[String]) -> Option<(String, Build)> {
             triple = Some(v);
         } else if a == "--release" || a == "-r" {
             profile = Some("release".into());
+        } else if a == "--debug" {
+            // `cargo install --debug`.
+            profile = Some("dev".into());
         } else if sub.is_none() && !a.starts_with('-') && !a.starts_with('+') {
             // The toolchain (`+nightly`) and cargo's own options come before the subcommand.
             sub = Some(a.to_string());
@@ -171,7 +281,11 @@ fn parse_any(command: &[String]) -> Option<(String, Build)> {
         i += 1;
     }
     let sub = sub?;
-    let default = if sub == "bench" { "bench" } else { "dev" };
+    let default = match sub.as_str() {
+        "bench" => "bench",
+        "install" => "release",
+        _ => "dev",
+    };
     let profile = profile.unwrap_or_else(|| default.into());
     let dir = match profile.as_str() {
         "dev" | "test" => "debug",
@@ -259,18 +373,23 @@ pub struct Shared {
 /// the workspace (`--target-dir`, `CARGO_TARGET_DIR`, `CARGO_BUILD_TARGET_DIR`).
 pub fn shared(command: &[String]) -> Option<Shared> {
     let build = parse(command)?;
-    // Without one of these, the workspace's own target folder: nobody else builds there.
-    let target = build
-        .target_dir
-        .clone()
-        .or_else(|| std::env::var_os("CARGO_TARGET_DIR").map(PathBuf::from))
-        .or_else(|| std::env::var_os("CARGO_BUILD_TARGET_DIR").map(PathBuf::from))?;
+    let target = target_dir(&build)?;
     let root = workspace_root(&build)?;
     Some(Shared {
         build,
         target,
         root,
     })
+}
+
+/// The target directory a command builds into when it is set from outside the workspace. Without one, the
+/// workspace's own target folder: nobody else builds there.
+fn target_dir(build: &Build) -> Option<PathBuf> {
+    build
+        .target_dir
+        .clone()
+        .or_else(|| std::env::var_os("CARGO_TARGET_DIR").map(PathBuf::from))
+        .or_else(|| std::env::var_os("CARGO_BUILD_TARGET_DIR").map(PathBuf::from))
 }
 
 /// Before the command runs: cleans this workspace's packages in the shared target directory when another checkout
@@ -643,24 +762,65 @@ mod tests {
     }
 
     #[test]
-    fn a_build_holds_the_shared_target_until_it_is_done() {
+    fn each_profile_folder_has_its_own_lock() {
+        let lock = |c: &str| lock_path(&cmd(c)).map(|p| normal(&p));
+        let dev = lock("cargo build --target-dir /t").unwrap();
+        assert!(dev.ends_with("/t/.fgate-lock-debug"), "{dev}");
+        // Everything that builds in target/debug shares cargo's lock there, and so fgate's.
+        for c in [
+            "cargo test --target-dir /t",
+            "cargo clippy --all-targets --target-dir=/t",
+            "cargo check --profile test --target-dir /t",
+            "cargo build --target x86_64-pc-windows-msvc --target-dir /t",
+            "cargo publish --dry-run --target-dir /t",
+            "cargo install --debug --path . --target-dir /t",
+        ] {
+            assert_eq!(lock(c).as_deref(), Some(dev.as_str()), "{c}");
+        }
+        let release = lock("cargo build --release --target-dir /t").unwrap();
+        assert!(release.ends_with("/t/.fgate-lock-release"), "{release}");
+        for c in [
+            "cargo bench --target-dir /t",
+            "cargo run -r -p game --target-dir /t",
+            "cargo install --path . --target-dir /t",
+        ] {
+            assert_eq!(lock(c).as_deref(), Some(release.as_str()), "{c}");
+        }
+        let ci = lock("cargo clippy --profile ci --target-dir /t").unwrap();
+        assert!(ci.ends_with("/t/.fgate-lock-ci"), "{ci}");
+        for c in [
+            "cargo fmt --target-dir /t",
+            "cargo publish --no-verify --target-dir /t",
+        ] {
+            assert_eq!(lock(c), None, "{c}");
+        }
+        assert_eq!(lock_name(Path::new("/t/.fgate-lock-release")), "/t/release");
+        assert_eq!(
+            lock_name(Path::new(r"E:\game\target\.fgate-lock-debug")),
+            r"E:\game\target\debug"
+        );
+    }
+
+    #[test]
+    fn a_build_holds_its_profile_folder_until_it_is_done() {
         let dir = std::env::temp_dir().join(format!("fgate-lock-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let shared = Shared {
-            build: parse(&cmd("cargo build")).unwrap(),
-            target: dir.clone(),
-            root: dir.clone(),
+        let (debug, release) = (
+            dir.join(".fgate-lock-debug"),
+            dir.join(".fgate-lock-release"),
+        );
+        assert!(!busy(&debug), "nobody built here yet");
+        let Take::Held(held) = take(&debug, "1\n2\na\ncargo build") else {
+            panic!("the lock is free");
         };
-        let held = lock(&shared).unwrap();
-        let other = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(dir.join(LOCK))
-            .unwrap();
-        assert!(!crate::sys::try_lock(&other), "another build waits");
+        assert!(busy(&debug), "another dev build waits");
+        assert!(matches!(take(&debug, "b"), Take::Busy));
+        assert_eq!(holder(&debug).as_deref(), Some("1\n2\na\ncargo build"));
+        let Take::Held(other) = take(&release, "c") else {
+            panic!("a release build goes beside it");
+        };
         drop(held);
-        assert!(crate::sys::try_lock(&other), "and goes once it is done");
-        crate::sys::unlock(&other);
+        assert!(!busy(&debug), "and goes once it is done");
         drop(other);
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -150,22 +150,35 @@ checkout's own code, and only what changed since the last copy. A kept executabl
 the way, which Windows allows, rather than overwritten. `keep_bins = 0` turns it off.
 
 The clean, the build and the keep go together: with two build slots, another checkout's clean could otherwise run
-between this build and its keep, or between its own clean and build. So a build into a shared target holds the
-target's lock (`.fgate-lock` in it) from its clean until its keep. Cargo lets only one build use a target directory at
-a time anyway, so no parallel building is lost; the second build waits in fgate instead of in cargo:
+between this build and its keep, or between its own clean and build. So a build into a shared target holds a lock
+from its clean until its keep, one per profile folder: `.fgate-lock-debug` for `build`, `check`, `clippy`, `test` and
+`doc`, `.fgate-lock-release` for `--release` and `bench`, one per custom profile. These are the folders cargo itself
+locks while it builds, so a dev build and a release build into one target run side by side, and two dev builds never
+could. A `cargo install` or a verifying `cargo publish` into a shared target takes the lock of the folder it builds in
+too, and so does every build into a shared target when `switch_clean` and `keep_bins` are off.
+
+A build takes its lock together with its slot, never one without the other. While another build holds its folder's
+lock, it keeps its place in line without a slot, and the jobs behind it that need another folder, or none (a release
+build, a script, a C++ build, a `cargo install` into its own target), go past it. Once the folder is free, it goes
+first again. A second dev build no longer sits in a slot, blocked in cargo, while the line waits behind it:
 
 ```text
-fgate: waiting for another build into E:\code\game\target to finish (a build's clean, build and kept executables go
-together)
+fgate: waiting for another build into E:\code\game\target\debug to finish: spaceport: cargo test --workspace (2m10s); #1 in line, the jobs behind that build elsewhere go ahead meanwhile
 ```
+
+`fgate status` marks such a waiter: `build line #1: … — waits for another build into E:\code\game\target\debug, later
+jobs go past it`. A script that runs cargo itself (below) can't say beforehand which folder it builds in, so it takes
+its slot first and its cargo waits for the folder's lock in the slot.
 
 ### Cargo inside a script
 
 A script that builds (`fgate sh build.sh`, `fgate python shots.py`) is gated as a whole, but fgate sees only the
 script, not the `cargo build` in it. So a gated command that is not cargo itself gets fgate's own `cargo` first on its
 PATH: a copy of fgate, `shim/cargo` in fgate's folder. When the script runs `cargo …`, the copy finds the real cargo
-further along the PATH and runs it as a nested gated command: no second wait, since the script holds the slot, but the
-same clean, record and kept executables as `fgate cargo …`, even when the script sets `CARGO_TARGET_DIR` itself.
+further along the PATH and runs it as a nested gated command: no second wait in line, since the script holds the slot
+(only for the folder's lock, while another build holds it), but the same clean, record and kept executables as
+`fgate cargo …`, even when the script sets `CARGO_TARGET_DIR` itself. A cargo nested in a gated cargo command doesn't
+wait for the lock its parent holds.
 Without it, the script's build left the record unchanged, and the next checkout's build took the script's crates for
 its own. A script that calls cargo by its full path, or clears the PATH, goes around it.
 
@@ -187,9 +200,10 @@ sources, not the packaged copy
 - **Kinds of slot.** Build slots for `cargo` and test runs, a GPU slot for games, renderers and screenshot
   scripts, so a screenshot run doesn't wait behind a build, `now` slots for small commands that skip the line, and
   one `solo` slot for a run that needs the machine to itself.
-- **A fair line.** Waiters are served in the order they arrived. Places in line and slots are file locks in
-  fgate's folder, which the system drops when a process ends however it ends. A crashed or killed agent never
-  leaves a slot taken.
+- **A fair line.** Waiters are served in the order they arrived. A build whose profile folder another build is using
+  keeps its place, and those behind it go past until the folder is free (see
+  [above](#checkouts-sharing-one-target-directory)). Places in line, slots and those folder locks are file locks,
+  which the system drops when a process ends however it ends. A crashed or killed agent never leaves a slot taken.
 - **Waiting for memory.** Memory is usually what runs out first, and a build's memory grows as it goes. A second
   command waits while less than `min_free_gb` is free. At night, every command waits for it, even alone.
 - **One job per command.** Once in, the command and everything it starts run as one job: at low priority,

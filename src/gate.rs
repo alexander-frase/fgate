@@ -5,13 +5,21 @@
 //! locks sit far past the end of the file, so others can still read what is written there, and Windows
 //! releases them when the holder ends. A ticket that can be locked by someone else is therefore left over
 //! from a process that has ended, and is cleared away.
+//!
+//! A cargo build into a shared target directory also needs that target's lock for its profile folder (`switch`),
+//! which only one build holds at a time. Its ticket names that lock, and it takes the lock together with its slot,
+//! so it never sits in a slot waiting for another build to finish. While its lock is held, or a waiter ahead of it
+//! needs the same lock, it keeps its place, and the waiters behind it that need another lock or none go past it.
+//! Once its lock is free it goes first again.
 
+use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::config::Config;
+use crate::switch::{self, Take, TargetLock};
 use crate::sys::{try_lock, unlock};
 
 /// How often a waiter looks again.
@@ -86,8 +94,8 @@ pub fn now() -> u64 {
         .unwrap_or(0)
 }
 
-/// What a slot holder or a waiter writes: since when, where from, what.
-fn describe(line: &str) -> String {
+/// What a slot holder, a waiter or a target lock's holder writes: since when, where from, what.
+pub fn describe(line: &str) -> String {
     format!("{}\n{}\n{}\n{}", now(), std::process::id(), here(), line)
 }
 
@@ -141,7 +149,7 @@ fn who(text: &str) -> String {
 }
 
 /// `terrain-features: cargo test --workspace (1m40s)`.
-fn summary(text: &str) -> String {
+pub fn summary(text: &str) -> String {
     let since = text.lines().next().and_then(|s| s.parse::<u64>().ok());
     let age = since.map_or("?".into(), |s| {
         duration(Duration::from_secs(now().saturating_sub(s)))
@@ -413,18 +421,60 @@ fn queue_dir(config: &Config, class: Class) -> PathBuf {
     config.dir.join("queue").join(class.name())
 }
 
-fn take_ticket(config: &Config, class: Class, line: &str) -> Ticket {
+/// A ticket's line naming the target lock its waiter needs.
+const NEEDS: &str = "needs ";
+
+/// A place in line, with the target lock its waiter needs, if any, written after what it runs.
+fn take_ticket(config: &Config, class: Class, line: &str, lock: Option<&Path>) -> Ticket {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     let path = queue_dir(config, class).join(format!("{nanos:024}-{}.ticket", std::process::id()));
+    let mut text = describe(line);
+    if let Some(lock) = lock {
+        text += &format!("\n{NEEDS}{}", switch::normal(lock));
+    }
     let file = open(&path).map(|mut f| {
         try_lock(&f);
-        write(&mut f, &describe(line));
+        write(&mut f, &text);
         f
     });
     Ticket { file, path }
+}
+
+/// The target lock a waiter needs, from its ticket.
+fn needs(ticket: &str) -> Option<&str> {
+    ticket.lines().skip(4).find_map(|l| l.strip_prefix(NEEDS))
+}
+
+/// Which waiters, first in line first, can't start yet because of the target lock they need: another build holds
+/// it, or a waiter ahead of them needs it too (that one goes first). They keep their places; the others count as if
+/// they weren't there, and go past them. `busy` is asked once per lock.
+fn held_up(needs: &[Option<&str>], busy: impl Fn(&str) -> bool) -> Vec<bool> {
+    let mut known: HashMap<&str, bool> = HashMap::new();
+    needs
+        .iter()
+        .map(|lock| {
+            let Some(lock) = *lock else {
+                return false;
+            };
+            // Asked for the first waiter that needs it; every later one waits behind that one anyway.
+            match known.get(lock) {
+                Some(_) => true,
+                None => {
+                    let held = busy(lock);
+                    known.insert(lock, held);
+                    held
+                }
+            }
+        })
+        .collect()
+}
+
+/// Who holds a target lock, for a waiter's message.
+fn lock_holder(lock: &Path) -> String {
+    switch::holder(lock).map_or("another build".into(), |t| summary(&t))
 }
 
 /// Everyone waiting in a class, first in line first; clears tickets whose waiter has ended.
@@ -471,11 +521,17 @@ fn free_memory() -> u64 {
     crate::sys::memory().1
 }
 
-/// Waits for a slot of `class` in fair order, and takes it.
+/// Waits for a slot of `class` in fair order, and takes it, together with the target lock `lock` when the command
+/// needs one (`switch::lock_path`).
 /// The settings are read again while waiting, when the file changes and once a minute (for the night limits), so
 /// slots added while commands wait are used at once.
-pub fn acquire(config: &Config, class: Class, line: &str) -> Held {
-    let ticket = take_ticket(config, class, line);
+pub fn acquire(
+    config: &Config,
+    class: Class,
+    line: &str,
+    lock: Option<&Path>,
+) -> (Held, Option<TargetLock>) {
+    let ticket = take_ticket(config, class, line, lock);
     let mut last_said: Option<(String, Instant)> = None;
     let mut fresh: Option<Config> = None;
     let mut read = (modified(&config.file()), Instant::now());
@@ -487,10 +543,16 @@ pub fn acquire(config: &Config, class: Class, line: &str) -> Held {
         }
         let config = fresh.as_ref().unwrap_or(config);
         let waiting = line_up(config, class);
-        let position = waiting
-            .iter()
-            .position(|(p, _)| *p == ticket.path)
-            .unwrap_or(0);
+        let me = waiting.iter().position(|(p, _)| *p == ticket.path);
+        let place = me.unwrap_or(0);
+        let needed: Vec<Option<&str>> = waiting.iter().map(|(_, t)| needs(t)).collect();
+        let held = held_up(&needed, |l| switch::busy(Path::new(l)));
+        // The waiters ahead that can start: those waiting for a target lock are passed.
+        let position = held[..place].iter().filter(|h| !**h).count();
+        let blocked = match me {
+            Some(i) => held[i],
+            None => lock.is_some_and(switch::busy),
+        };
         let mine = holders(config, class);
         let free: Vec<usize> = mine
             .iter()
@@ -514,6 +576,38 @@ pub fn acquire(config: &Config, class: Class, line: &str) -> Held {
             .flatten()
         {
             why = format!("waiting: {reason}");
+            situation = key;
+        } else if let Some(lock) = lock.filter(|_| blocked) {
+            // It keeps its place, and the jobs behind it that build elsewhere go past it.
+            let mine = switch::normal(lock);
+            let first = waiting[..place]
+                .iter()
+                .find(|(_, t)| needs(t) == Some(mine.as_str()));
+            let (holder, key) = match first {
+                Some((_, first)) => (
+                    format!(
+                        "the build into {} ahead in line to go first: {}",
+                        switch::lock_name(lock),
+                        summary(first)
+                    ),
+                    format!("behind {}", who(first)),
+                ),
+                None => {
+                    let text = switch::holder(lock).unwrap_or_default();
+                    (
+                        format!(
+                            "another build into {} to finish: {}",
+                            switch::lock_name(lock),
+                            lock_holder(lock)
+                        ),
+                        format!("lock {}", who(&text)),
+                    )
+                }
+            };
+            why = format!(
+                "waiting for {holder}; #{} in line, the jobs behind that build elsewhere go ahead meanwhile",
+                place + 1
+            );
             situation = key;
         } else if position < free.len() && !others.is_empty() {
             let running: Vec<String> = others
@@ -545,6 +639,16 @@ pub fn acquire(config: &Config, class: Class, line: &str) -> Held {
                 );
                 situation = "memory".into();
             } else {
+                // The target lock first, so the slot is never held while another build has the folder.
+                let target = match lock.map(|l| switch::take(l, &describe(line))) {
+                    None | Some(Take::Without) => None,
+                    Some(Take::Held(target)) => Some(target),
+                    Some(Take::Busy) => {
+                        // Taken between looking and taking: look again shortly.
+                        std::thread::sleep(POLL);
+                        continue;
+                    }
+                };
                 for index in free {
                     let Some(mut file) = open(&slot_path(config, class, index)) else {
                         continue;
@@ -565,26 +669,37 @@ pub fn acquire(config: &Config, class: Class, line: &str) -> Held {
                         let text = describe(line);
                         write(&mut file, &text);
                         drop(ticket);
-                        return Held {
+                        let held = Held {
                             file: Some(file),
                             index,
                             path: slot_path(config, class, index),
                             usage_at: text.len() as u64,
                             handed_back: (class == Class::Solo).then(|| handed_back_path(config)),
                         };
+                        return (held, target);
                     }
                 }
-                // Someone took it between looking and taking, or a solo run came in: look again shortly.
+                // Someone took it between looking and taking, or a solo run came in: give the target lock back and
+                // look again shortly.
+                drop(target);
                 std::thread::sleep(POLL);
                 continue;
             }
         }
         if why.is_empty() {
             let running: Vec<String> = mine.iter().flatten().map(|t| summary(t)).collect();
+            let passed = if place > position {
+                format!(
+                    " ({} ahead wait for another build to finish, this one goes past them)",
+                    place - position
+                )
+            } else {
+                String::new()
+            };
             why = format!(
-                "waiting for a {} slot: #{} in line; running: {}",
+                "waiting for a {} slot: #{} in line{passed}; running: {}",
                 class.name(),
-                position + 1,
+                place + 1,
                 running.join(" | ")
             );
             let running: Vec<String> = mine.iter().flatten().map(|t| who(t)).collect();
@@ -636,8 +751,55 @@ pub fn print_status(config: &Config) {
             }
             println!("  {} slot {i}: {text}", class.name());
         }
-        for (n, (_, text)) in line_up(config, class).iter().enumerate() {
-            println!("  {} line #{}: {}", class.name(), n + 1, summary(text));
+        let waiting = line_up(config, class);
+        let needed: Vec<Option<&str>> = waiting.iter().map(|(_, t)| needs(t)).collect();
+        let held = held_up(&needed, |l| switch::busy(Path::new(l)));
+        for (n, (_, text)) in waiting.iter().enumerate() {
+            let mut line = summary(text);
+            if let (true, Some(lock)) = (held[n], needed[n]) {
+                line += &format!(
+                    " — waits for another build into {}, later jobs go past it",
+                    switch::lock_name(Path::new(lock))
+                );
+            }
+            println!("  {} line #{}: {line}", class.name(), n + 1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_ticket_names_the_lock_its_waiter_needs() {
+        let ticket = "1\n2\ngame\ncargo build --release\nneeds e:/game/target/.fgate-lock-release";
+        assert_eq!(needs(ticket), Some("e:/game/target/.fgate-lock-release"));
+        assert_eq!(needs("1\n2\ngame\nsh build.sh"), None);
+        // What it runs is not what it needs, whatever the command says.
+        assert_eq!(needs("1\n2\ngame\nneeds x"), None);
+    }
+
+    #[test]
+    fn waiters_go_past_a_build_whose_folder_is_busy() {
+        let (dev, release, ci) = (Some("debug"), Some("release"), Some("ci"));
+        let asked = std::cell::RefCell::new(Vec::new());
+        let busy = |lock: &str| {
+            asked.borrow_mut().push(lock.to_string());
+            lock == "debug"
+        };
+        let line = [dev, None, release, dev, release, ci, None];
+        let held = held_up(&line, busy);
+        // The dev builds wait for the running one; the second release build waits for the first, which goes.
+        assert_eq!(held, [true, false, false, true, true, false, false]);
+        assert_eq!(
+            *asked.borrow(),
+            ["debug", "release", "ci"],
+            "each lock is asked once"
+        );
+        // With one free slot the script second in line goes first, then the release build; the dev build keeps
+        // its place at the front for when the folder is free.
+        let ahead = |me: usize| held[..me].iter().filter(|h| !**h).count();
+        assert_eq!((ahead(1), ahead(2), ahead(6)), (0, 1, 3));
     }
 }
