@@ -122,8 +122,9 @@ judges freshness by file times. When another checkout built more recently, your 
 and cargo reuses it: your program runs another checkout's code, or fails to compile against its API.
 
 So before a compiling cargo command (`build`, `check`, `test`, `run`, `clippy`, `doc`, `bench`, `rustc`) into a
-target directory set by `CARGO_TARGET_DIR` or `--target-dir`, fgate looks at `.fgate-checkouts` in that directory:
-who built this profile last (`debug`, `release`, a custom profile, per target triple). When it was another checkout,
+target directory set by `CARGO_TARGET_DIR` or `--target-dir`, fgate looks at that profile folder's record in that
+directory (`.fgate-checkouts-debug`, `.fgate-checkouts-release`, beside the folder's lock): who built this profile
+last (`debug`, `release`, a custom profile, per target triple). When it was another checkout,
 or nobody is recorded yet, fgate first cleans this workspace's own packages for that profile (`cargo clean -p
 <member> …`; the dependencies stay) and records this checkout:
 

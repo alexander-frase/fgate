@@ -57,6 +57,16 @@ build b
 [ "$(ran b)" = "checkout b" ] || { echo "b's build kept no executable of its own"; exit 1; }
 build b | grep -q "(unchanged)" || { echo "an unchanged executable was copied again"; exit 1; }
 
+# A dev build and a release build of two checkouts, side by side in that target, both cleaning first: each keeps its
+# executable, as each profile folder has a record of its own (one shared record could lose either line).
+printf 'build_slots = 2\nnight_build_slots = 2\nmin_free_gb = 0\nnight_min_free_gb = 0\n' > "$FGATE_DIR/config.txt"
+build a > "$W/a.log" &
+(cd "$W/b" && CARGO_TARGET_DIR="$W/shared" "$F" cargo build -q --release 2>&1) > "$W/b.log" &
+wait
+grep -q "fgate: kept" "$W/a.log" || { cat "$W/a.log"; echo "a's dev build beside a release build kept nothing"; exit 1; }
+grep -q "fgate: kept" "$W/b.log" || { cat "$W/b.log"; echo "b's release build beside a dev build kept nothing"; exit 1; }
+[ "$("$W/b/target/fgate-bin/release/app")" = "checkout b" ] || { echo "b's release build kept another's code"; exit 1; }
+
 # Builds into one shared target take turns per profile folder, as cargo's own locks do. With two build slots, a dev
 # build waits for the dev build running there without taking the free slot, and a release build behind it goes past.
 # A stand-in cargo finds no workspace, and "builds" by noting when it starts and ends.
