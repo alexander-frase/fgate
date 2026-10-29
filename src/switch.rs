@@ -7,10 +7,10 @@
 //! your build runs another checkout's code, or fails against its older or newer API. The dependencies are the same
 //! in every checkout and safe to share.
 //!
-//! So before a compiling cargo command fgate looks at who built that profile last (a `.fgate-checkouts` file in the
-//! target directory). When it was another checkout, or nobody is recorded, it cleans this workspace's own packages
-//! for that profile first (`cargo clean -p <member> …`, the dependencies stay) and records this checkout. Setting
-//! `switch_clean = 0` turns it off.
+//! So before a compiling cargo command fgate looks at who built that profile last (a record in the target directory,
+//! one per profile folder: `.fgate-checkouts-release`). When it was another checkout, or nobody is recorded, it
+//! cleans this workspace's own packages for that profile first (`cargo clean -p <member> …`, the dependencies stay)
+//! and records this checkout. Setting `switch_clean = 0` turns it off.
 //!
 //! That clean also deletes the executables a checkout has just built, as soon as the next checkout's build gets
 //! the slot. So after a build, while the slot is still held, fgate copies the workspace's executables into the
@@ -25,6 +25,11 @@
 //! folders cargo itself locks while it builds. A dev build and a release build into one target run side by side, as
 //! cargo lets them. Two dev builds can't, so the second waits in fgate's line rather than in a slot, blocked in
 //! cargo, and the line lets later jobs that build elsewhere go past it meanwhile (`gate`).
+//!
+//! Each profile folder's record sits beside its lock and is only read and written by the build holding that lock.
+//! One record for the whole target (as before 0.8.1) let a dev build and a release build, side by side, each write
+//! the file back from the copy it read before its clean: one of them lost its line, and its keep then found another
+//! checkout named and kept nothing.
 
 use std::ffi::OsString;
 use std::fs::File;
@@ -33,7 +38,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::SystemTime;
 
-/// The record in the target directory: one line per profile, `<profile key>\t<workspace root>`.
+/// The start of the records in the target directory, one per profile folder (`.fgate-checkouts-release`), the
+/// folder's name following as for its lock: one line per profile key, `<profile key>\t<workspace root>` (a build for
+/// another target triple shares the host folder's record, as it shares its lock).
 const STAMP: &str = ".fgate-checkouts";
 
 /// The start of the lock files a build holds in a shared target directory from its clean to its keep; the profile
@@ -204,6 +211,11 @@ pub struct Build {
 }
 
 impl Build {
+    /// The record of who built this profile last: the profile folder's own, guarded by its lock.
+    fn stamp(&self, target: &Path) -> PathBuf {
+        target.join(format!("{STAMP}-{}", self.folder()))
+    }
+
     /// The profile folder without the target triple's: `debug`, `release`, a custom profile's name.
     fn folder(&self) -> &str {
         self.key.rsplit('/').next().unwrap_or(&self.key)
@@ -400,7 +412,7 @@ pub fn prepare(shared: &Shared) {
         target,
         root,
     } = shared;
-    let stamp = target.join(STAMP);
+    let stamp = build.stamp(target);
     let text = std::fs::read_to_string(&stamp).unwrap_or_default();
     let last = last_builder(&text, &build.key);
     if last.as_deref().is_some_and(|l| same(l, root)) {
@@ -442,8 +454,18 @@ pub fn prepare(shared: &Shared) {
     }
     match clean.status() {
         Ok(s) if s.success() => {
-            let _ = std::fs::create_dir_all(target);
-            let _ = std::fs::write(&stamp, record(&text, &build.key, &root.to_string_lossy()));
+            // Read again: the clean took a while, and a build that went ahead without the lock may have written.
+            let now = std::fs::read_to_string(&stamp).unwrap_or_default();
+            let written = std::fs::create_dir_all(target).and_then(|()| {
+                std::fs::write(&stamp, record(&now, &build.key, &root.to_string_lossy()))
+            });
+            if let Err(e) = written {
+                eprintln!(
+                    "fgate: could not record this checkout in {} ({e}): the next build here cleans again, and \
+                     this one's executables aren't kept (switch_clean)",
+                    stamp.display()
+                );
+            }
         }
         Ok(s) => eprintln!("fgate: cargo clean failed ({s}); building without it"),
         Err(e) => eprintln!("fgate: could not run cargo clean ({e}); building without it"),
@@ -460,11 +482,25 @@ pub fn keep(shared: &Shared) {
         target,
         root,
     } = shared;
-    let text = std::fs::read_to_string(target.join(STAMP)).unwrap_or_default();
-    if !last_builder(&text, &build.key).is_some_and(|l| same(&l, root)) {
-        return;
+    let text = std::fs::read_to_string(build.stamp(target)).unwrap_or_default();
+    match last_builder(&text, &build.key) {
+        Some(l) if same(&l, root) => {}
+        // Nothing recorded: switch_clean is off, so nobody can say whose code the executables are.
+        None => return,
+        Some(other) => {
+            eprintln!(
+                "fgate: kept no executables: the record says {other} built {} in {} last, not this checkout \
+                 (keep_bins)",
+                build.key,
+                target.display()
+            );
+            return;
+        }
     }
     let Some(bins) = metadata(build).map(|m| bin_names(&m)) else {
+        eprintln!(
+            "fgate: kept no executables: cargo metadata failed for this workspace (keep_bins)"
+        );
         return;
     };
     let from = target.join(&build.key);
@@ -729,6 +765,32 @@ mod tests {
         assert_eq!(last_builder(&t, "release").as_deref(), Some("E:/b"));
         assert_eq!(last_builder(&t, "ci"), None);
         assert!(same("E:/code/game/", Path::new("E:/code/game")));
+    }
+
+    /// Each profile folder has a record of its own, beside its lock: a dev and a release build never share one, and a
+    /// build for another target triple shares the host folder's, as it shares its lock.
+    #[test]
+    fn each_profile_folder_has_its_own_record() {
+        let of = |args: &[&str]| {
+            let command: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+            parse(&command).expect("a build").stamp(Path::new("/t"))
+        };
+        let release = of(&["cargo", "build", "--release"]);
+        assert_eq!(release, Path::new("/t").join(".fgate-checkouts-release"));
+        assert_eq!(
+            of(&["cargo", "test"]),
+            Path::new("/t").join(".fgate-checkouts-debug")
+        );
+        assert_eq!(
+            of(&[
+                "cargo",
+                "build",
+                "--release",
+                "--target",
+                "x86_64-unknown-linux-gnu"
+            ]),
+            release
+        );
     }
 
     #[test]
